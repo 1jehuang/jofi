@@ -55,6 +55,18 @@ struct UiArgs {
     #[arg(long, default_value_t = 25.0)]
     result_gap: f32,
 
+    /// Horizontal text start position as a fraction of screen width.
+    #[arg(long, default_value_t = 0.35)]
+    x_percent: f32,
+
+    /// Vertical text start position as a fraction of screen height.
+    #[arg(long, default_value_t = 0.35)]
+    y_percent: f32,
+
+    /// Integer Wayland buffer scale. Use 2 for sharper text on fractional/high-DPI outputs.
+    #[arg(long, default_value_t = 2)]
+    render_scale: u32,
+
     /// Maximum visible launcher results.
     #[arg(long, default_value_t = 5)]
     ui_results: usize,
@@ -68,6 +80,9 @@ impl From<UiArgs> for UiOptions {
             query_size_px: args.query_size,
             result_size_px: args.result_size,
             result_gap_px: args.result_gap,
+            x_percent: args.x_percent,
+            y_percent: args.y_percent,
+            render_scale: args.render_scale.max(1),
             max_results: args.ui_results,
         }
     }

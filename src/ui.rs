@@ -48,6 +48,9 @@ pub struct UiOptions {
     pub query_size_px: f32,
     pub result_size_px: f32,
     pub result_gap_px: f32,
+    pub x_percent: f32,
+    pub y_percent: f32,
+    pub render_scale: u32,
     pub max_results: usize,
 }
 
@@ -60,6 +63,9 @@ impl Default for UiOptions {
             query_size_px: 34.0,
             result_size_px: 28.0,
             result_gap_px: 25.0,
+            x_percent: 0.35,
+            y_percent: 0.35,
+            render_scale: 2,
             max_results: DEFAULT_MAX_RESULTS,
         }
     }
@@ -305,11 +311,14 @@ impl LauncherApp {
         let start = Instant::now();
         let width = self.width;
         let height = self.height;
-        let stride = width as i32 * 4;
+        let render_scale = self.options.render_scale.max(1);
+        let buffer_width = width.saturating_mul(render_scale);
+        let buffer_height = height.saturating_mul(render_scale);
+        let stride = buffer_width as i32 * 4;
         let lines = self.visible_lines();
         let Ok((buffer, canvas)) = self.pool.create_buffer(
-            width as i32,
-            height as i32,
+            buffer_width as i32,
+            buffer_height as i32,
             stride,
             wl_shm::Format::Argb8888,
         ) else {
@@ -318,12 +327,24 @@ impl LauncherApp {
         };
 
         fill_background(canvas, self.options.background_alpha);
-        draw_centered_lines(canvas, width, height, &self.font, &lines);
+        draw_lines(
+            canvas,
+            buffer_width,
+            buffer_height,
+            &self.font,
+            &lines,
+            LayoutSpec {
+                x: (width as f32 * self.options.x_percent).round() * render_scale as f32,
+                y: (height as f32 * self.options.y_percent).round() * render_scale as f32,
+                scale: render_scale as f32,
+            },
+        );
 
         self.layer
             .wl_surface()
-            .damage_buffer(0, 0, width as i32, height as i32);
+            .damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
         if buffer.attach_to(self.layer.wl_surface()).is_ok() {
+            let _ = self.layer.set_buffer_scale(render_scale);
             self.layer.commit();
         }
         self.last_draw_ns = start.elapsed().as_nanos() as u64;
@@ -331,6 +352,9 @@ impl LauncherApp {
             let mut fields = Map::new();
             fields.insert("width".to_string(), json!(width));
             fields.insert("height".to_string(), json!(height));
+            fields.insert("buffer_width".to_string(), json!(buffer_width));
+            fields.insert("buffer_height".to_string(), json!(buffer_height));
+            fields.insert("render_scale".to_string(), json!(render_scale));
             fields.insert("duration_ns".to_string(), json!(self.last_draw_ns));
             fields.insert("query_len".to_string(), json!(self.query.chars().count()));
             fields.insert("results".to_string(), json!(self.results.len()));
@@ -633,47 +657,45 @@ impl Color {
     }
 }
 
-fn draw_centered_lines(
+#[derive(Debug, Clone, Copy)]
+struct LayoutSpec {
+    x: f32,
+    y: f32,
+    scale: f32,
+}
+
+fn draw_lines(
     canvas: &mut [u8],
     width: u32,
-    height: u32,
+    _height: u32,
     font: &Font,
     lines: &[LineSpec],
+    spec: LayoutSpec,
 ) {
     if lines.is_empty() {
         return;
     }
 
-    let total_height: f32 = lines
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            line.size_px
-                + if idx + 1 == lines.len() {
-                    0.0
-                } else {
-                    line.gap_after_px
-                }
-        })
-        .sum();
-    let mut y = ((height as f32 - total_height) * 0.5).max(0.0);
+    let x = spec.x.round();
+    let mut y = spec.y.round();
     let fonts = [font.clone()];
 
     for line in lines {
         y = y.round();
-        draw_text_centered(
+        draw_text(
             canvas,
             width,
             font,
             TextDraw {
                 fonts: &fonts,
                 text: &line.text,
-                size_px: line.size_px,
+                size_px: line.size_px * spec.scale,
+                x,
                 y,
                 color: line.color,
             },
         );
-        y += line.size_px + line.gap_after_px;
+        y += (line.size_px + line.gap_after_px) * spec.scale;
     }
 }
 
@@ -681,14 +703,15 @@ struct TextDraw<'a> {
     fonts: &'a [Font; 1],
     text: &'a str,
     size_px: f32,
+    x: f32,
     y: f32,
     color: Color,
 }
 
-fn draw_text_centered(canvas: &mut [u8], width: u32, font: &Font, spec: TextDraw<'_>) {
+fn draw_text(canvas: &mut [u8], width: u32, font: &Font, spec: TextDraw<'_>) {
     let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
     layout.reset(&LayoutSettings {
-        x: 0.0,
+        x: spec.x,
         y: spec.y,
         ..LayoutSettings::default()
     });
@@ -698,17 +721,9 @@ fn draw_text_centered(canvas: &mut [u8], width: u32, font: &Font, spec: TextDraw
     if glyphs.is_empty() {
         return;
     }
-    let min_x = glyphs.iter().map(|g| g.x).fold(f32::INFINITY, f32::min);
-    let max_x = glyphs
-        .iter()
-        .map(|g| g.x + g.width as f32)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let text_width = (max_x - min_x).max(0.0);
-    let x_offset = ((width as f32 - text_width) * 0.5).round() - min_x;
-
     for glyph in glyphs {
         let (metrics, bitmap) = font.rasterize_config(glyph.key);
-        let gx = (glyph.x + x_offset).round() as i32;
+        let gx = glyph.x.round() as i32;
         let gy = glyph.y.round() as i32;
         draw_glyph(
             canvas,

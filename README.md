@@ -62,6 +62,7 @@ UI options:
 
 ```sh
 jofi --background-alpha 170 --query-size 34 --result-size 28 --result-gap 25 --ui-results 5
+jofi --x-percent 0.35 --y-percent 0.35 --render-scale 2
 jofi --font /usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf
 ```
 
