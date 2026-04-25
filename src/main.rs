@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use jofi::desktop::{DiscoveryOptions, discover_desktop_entries};
 use jofi::launcher::{build_launch_command, launch};
 use jofi::search::{SearchIndex, SearchResult};
 use jofi::telemetry::{MemorySnapshot, Telemetry, default_telemetry_path};
+use jofi::ui::{UiOptions, run_launcher};
 use serde::Serialize;
 use serde_json::{Map, json};
 use std::path::PathBuf;
@@ -24,12 +25,52 @@ struct Cli {
     #[arg(long, global = true)]
     include_hidden: bool,
 
+    #[command(flatten)]
+    ui: UiArgs,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct UiArgs {
+    /// Font file to use for the Wayland UI. Also configurable with JOFI_FONT.
+    #[arg(long)]
+    font: Option<PathBuf>,
+
+    /// Fullscreen background opacity from 0-255.
+    #[arg(long, default_value_t = 205)]
+    background_alpha: u8,
+
+    /// Query text size in physical pixels.
+    #[arg(long, default_value_t = 34.0)]
+    query_size: f32,
+
+    /// Result text size in physical pixels.
+    #[arg(long, default_value_t = 28.0)]
+    result_size: f32,
+
+    /// Maximum visible launcher results.
+    #[arg(long, default_value_t = 5)]
+    ui_results: usize,
+}
+
+impl From<UiArgs> for UiOptions {
+    fn from(args: UiArgs) -> Self {
+        UiOptions {
+            font_path: args.font,
+            background_alpha: args.background_alpha,
+            query_size_px: args.query_size,
+            result_size_px: args.result_size,
+            max_results: args.ui_results,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open the graphical Wayland launcher UI.
+    Run(UiArgs),
     /// List indexed desktop entries.
     List(OutputArgs),
     /// Search desktop entries with jofi's typo-resistant ranker.
@@ -98,12 +139,6 @@ struct ProfileArgs {
     json: bool,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum OutputFormat {
-    Text,
-    Json,
-}
-
 #[derive(Debug, Serialize)]
 struct ProfileReport {
     entries: usize,
@@ -135,11 +170,18 @@ fn main() -> Result<()> {
     };
 
     match cli.command {
-        Command::List(args) => cmd_list(args, &discovery_options, &telemetry),
-        Command::Search(args) => cmd_search(args, &discovery_options, &telemetry),
-        Command::Launch(args) => cmd_launch(args, &discovery_options, &telemetry),
-        Command::Profile(args) => cmd_profile(args, &discovery_options, &telemetry),
+        Some(Command::Run(args)) => cmd_run(args, &discovery_options, telemetry),
+        Some(Command::List(args)) => cmd_list(args, &discovery_options, &telemetry),
+        Some(Command::Search(args)) => cmd_search(args, &discovery_options, &telemetry),
+        Some(Command::Launch(args)) => cmd_launch(args, &discovery_options, &telemetry),
+        Some(Command::Profile(args)) => cmd_profile(args, &discovery_options, &telemetry),
+        None => cmd_run(cli.ui, &discovery_options, telemetry),
     }
+}
+
+fn cmd_run(args: UiArgs, options: &DiscoveryOptions, telemetry: Telemetry) -> Result<()> {
+    let index = load_index(options, &telemetry)?;
+    run_launcher(index, telemetry, args.into())
 }
 
 fn load_index(options: &DiscoveryOptions, telemetry: &Telemetry) -> Result<SearchIndex> {

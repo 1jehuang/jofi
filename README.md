@@ -32,11 +32,37 @@ Excluded from the product vision:
 
 ## Usage
 
+Open the graphical Wayland launcher:
+
+```sh
+cargo run --release
+# or explicitly:
+cargo run --release -- run
+```
+
+The v1 UI is intentionally minimal:
+
+- fullscreen dim transparent overlay
+- centered text only
+- no boxes, borders, icons, placeholder, caret, or blur
+- typed query appears only when non-empty
+- five visible entries by default
+- selected entry is color-coded
+
+CLI/debug commands:
+
 ```sh
 cargo run -- profile
 cargo run -- search chrmoe
 cargo run -- launch firefox --dry-run
 cargo run -- list --limit 20
+```
+
+UI options:
+
+```sh
+jofi --background-alpha 205 --query-size 34 --result-size 28 --ui-results 5
+jofi --font /usr/share/fonts/TTF/JetBrainsMonoNerdFont-Light.ttf
 ```
 
 Telemetry is on by default and logs JSONL to:
