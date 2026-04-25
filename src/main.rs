@@ -63,8 +63,8 @@ struct UiArgs {
     #[arg(long, default_value_t = 0.35)]
     y_percent: f32,
 
-    /// Integer Wayland buffer scale. Use 2 for sharper text on fractional/high-DPI outputs.
-    #[arg(long, default_value_t = 2)]
+    /// Integer Wayland buffer scale. Higher values render sharper text at the cost of draw time.
+    #[arg(long, default_value_t = 3)]
     render_scale: u32,
 
     /// Maximum visible launcher results.

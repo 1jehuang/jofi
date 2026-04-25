@@ -65,7 +65,7 @@ impl Default for UiOptions {
             result_gap_px: 25.0,
             x_percent: 0.35,
             y_percent: 0.35,
-            render_scale: 2,
+            render_scale: 3,
             max_results: DEFAULT_MAX_RESULTS,
         }
     }
@@ -378,7 +378,7 @@ impl LauncherApp {
                 text: result.entry.name.clone(),
                 size_px: self.options.result_size_px,
                 color: if idx == self.selected {
-                    Color::rgb(255, 99, 71)
+                    Color::rgb(0, 255, 255)
                 } else {
                     Color::rgb(255, 255, 255)
                 },
