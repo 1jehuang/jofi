@@ -61,9 +61,23 @@ cargo run -- list --limit 20
 UI options:
 
 ```sh
-jofi --background-alpha 205 --query-size 34 --result-size 28 --ui-results 5
-jofi --font /usr/share/fonts/TTF/JetBrainsMonoNerdFont-Light.ttf
+jofi --background-alpha 170 --query-size 34 --result-size 28 --result-gap 25 --ui-results 5
+jofi --font /usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf
 ```
+
+On first run, `jofi` imports tofi's drun history from:
+
+```text
+$XDG_STATE_HOME/tofi-drun-history
+```
+
+into:
+
+```text
+$XDG_STATE_HOME/jofi/history
+```
+
+Then it keeps updating the jofi history file on launches.
 
 Telemetry is on by default and logs JSONL to:
 

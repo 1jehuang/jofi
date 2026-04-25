@@ -1,4 +1,5 @@
 use crate::desktop::DesktopEntry;
+use crate::history::History;
 use crate::launcher::{build_launch_command, launch};
 use crate::search::{SearchIndex, SearchResult};
 use crate::telemetry::Telemetry;
@@ -46,6 +47,7 @@ pub struct UiOptions {
     pub background_alpha: u8,
     pub query_size_px: f32,
     pub result_size_px: f32,
+    pub result_gap_px: f32,
     pub max_results: usize,
 }
 
@@ -53,15 +55,22 @@ impl Default for UiOptions {
     fn default() -> Self {
         Self {
             font_path: None,
-            background_alpha: 205,
+            // Matches tofi's #000A fullscreen background by default.
+            background_alpha: 0xAA,
             query_size_px: 34.0,
             result_size_px: 28.0,
+            result_gap_px: 25.0,
             max_results: DEFAULT_MAX_RESULTS,
         }
     }
 }
 
-pub fn run_launcher(index: SearchIndex, telemetry: Telemetry, options: UiOptions) -> Result<()> {
+pub fn run_launcher(
+    index: SearchIndex,
+    telemetry: Telemetry,
+    options: UiOptions,
+    history: History,
+) -> Result<()> {
     let startup = Instant::now();
     let font_path = resolve_font_path(options.font_path.clone())?;
     let font_bytes = fs::read(&font_path)
@@ -109,6 +118,7 @@ pub fn run_launcher(index: SearchIndex, telemetry: Telemetry, options: UiOptions
         font,
         font_path,
         options,
+        history,
         telemetry,
         started_at: startup,
         last_draw_ns: 0,
@@ -160,6 +170,7 @@ struct LauncherApp {
     font: Font,
     font_path: PathBuf,
     options: UiOptions,
+    history: History,
     telemetry: Telemetry,
     started_at: Instant,
     last_draw_ns: u64,
@@ -205,6 +216,15 @@ impl LauncherApp {
             fields.insert("command".to_string(), json!(command));
             fields
         });
+        self.history.increment(&entry.name);
+        if let Err(err) = self.history.save() {
+            self.telemetry.event("history.save_error", {
+                let mut fields = Map::new();
+                fields.insert("entry".to_string(), json!(entry.name));
+                fields.insert("error".to_string(), json!(err.to_string()));
+                fields
+            });
+        }
         if let Err(err) = launch(&entry) {
             self.telemetry.event("ui.launch_error", {
                 let mut fields = Map::new();
@@ -334,11 +354,11 @@ impl LauncherApp {
                 text: result.entry.name.clone(),
                 size_px: self.options.result_size_px,
                 color: if idx == self.selected {
-                    Color::rgb(138, 173, 255)
+                    Color::rgb(255, 99, 71)
                 } else {
-                    Color::rgb(200, 200, 208)
+                    Color::rgb(255, 255, 255)
                 },
-                gap_after_px: self.options.result_size_px * 0.35,
+                gap_after_px: self.options.result_gap_px,
             });
         }
         lines
@@ -640,6 +660,7 @@ fn draw_centered_lines(
     let fonts = [font.clone()];
 
     for line in lines {
+        y = y.round();
         draw_text_centered(
             canvas,
             width,
@@ -780,9 +801,11 @@ fn resolve_font_path(configured: Option<PathBuf>) -> Result<PathBuf> {
     }
 
     let candidates = [
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Light.ttf",
         "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFont-Regular.ttf",
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Light.ttf",
         "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",

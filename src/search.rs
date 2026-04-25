@@ -1,4 +1,5 @@
 use crate::desktop::DesktopEntry;
+use crate::history::History;
 use serde::Serialize;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
@@ -21,6 +22,7 @@ struct SearchDoc {
     id_norm: String,
     acronym: String,
     weighted_fields: Vec<WeightedField>,
+    history_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +34,15 @@ struct WeightedField {
 
 impl SearchIndex {
     pub fn new(entries: Vec<DesktopEntry>) -> Self {
-        let docs = entries.into_iter().map(SearchDoc::new).collect();
+        Self::with_history(entries, &History::default())
+    }
+
+    pub fn with_history(entries: Vec<DesktopEntry>, history: &History) -> Self {
+        let mut docs = entries
+            .into_iter()
+            .map(|entry| SearchDoc::new(entry, history))
+            .collect::<Vec<_>>();
+        docs.sort_by(sort_docs_for_empty_query);
         Self { docs }
     }
 
@@ -52,8 +62,12 @@ impl SearchIndex {
                 .iter()
                 .take(limit)
                 .map(|doc| SearchResult {
-                    score: 0,
-                    reason: "empty-query".to_string(),
+                    score: doc.history_score(),
+                    reason: if doc.history_count > 0 {
+                        format!("history:{}", doc.history_count)
+                    } else {
+                        "empty-query".to_string()
+                    },
                     entry: doc.entry.clone(),
                 })
                 .collect();
@@ -87,7 +101,8 @@ impl SearchIndex {
 }
 
 impl SearchDoc {
-    fn new(entry: DesktopEntry) -> Self {
+    fn new(entry: DesktopEntry, history: &History) -> Self {
+        let history_count = history.count_for(&entry.name);
         let name_norm = normalize(&entry.name);
         let id_norm = normalize(&entry.id);
         let acronym = acronym(&name_norm);
@@ -139,6 +154,15 @@ impl SearchDoc {
             id_norm,
             acronym,
             weighted_fields,
+            history_count,
+        }
+    }
+
+    fn history_score(&self) -> i32 {
+        if self.history_count == 0 {
+            0
+        } else {
+            20_000 + (self.history_count.min(10_000) as i32 * 10)
         }
     }
 }
@@ -174,6 +198,18 @@ fn acronym(normalized_name: &str) -> String {
         .split_whitespace()
         .filter_map(|word| word.chars().next())
         .collect()
+}
+
+fn sort_docs_for_empty_query(a: &SearchDoc, b: &SearchDoc) -> std::cmp::Ordering {
+    b.history_count
+        .cmp(&a.history_count)
+        .then_with(|| a.entry.source_rank.cmp(&b.entry.source_rank))
+        .then_with(|| {
+            a.entry
+                .name
+                .to_lowercase()
+                .cmp(&b.entry.name.to_lowercase())
+        })
 }
 
 fn score_doc(doc: &SearchDoc, query_norm: &str, query_tokens: &[&str]) -> Option<SearchResult> {
@@ -215,6 +251,11 @@ fn score_doc(doc: &SearchDoc, query_norm: &str, query_tokens: &[&str]) -> Option
     // Personal entries in ~/.local/share/applications are discovered first and get
     // a small boost. This makes user scripts feel first-class without special casing.
     score += (10_i32 - doc.entry.source_rank as i32).max(0) * 25;
+
+    if doc.history_count > 0 {
+        score += doc.history_score();
+        reasons.push(format!("history:{}", doc.history_count));
+    }
 
     Some(SearchResult {
         score,
@@ -361,6 +402,21 @@ mod tests {
         )]);
         let results = index.search("wifi", 5);
         assert_eq!(results[0].entry.name, "Disconnect iPhone Hotspot");
+    }
+
+    #[test]
+    fn empty_query_uses_history_order() {
+        let mut history = History::default();
+        history.increment("Play Song");
+        history.increment("Play Song");
+        history.increment("Firefox");
+        let index = SearchIndex::with_history(
+            vec![entry("Firefox", &[]), entry("Play Song", &[])],
+            &history,
+        );
+        let results = index.search("", 5);
+        assert_eq!(results[0].entry.name, "Play Song");
+        assert_eq!(results[0].reason, "history:2");
     }
 
     #[test]

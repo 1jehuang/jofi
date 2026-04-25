@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use jofi::desktop::{DiscoveryOptions, discover_desktop_entries};
+use jofi::history::History;
 use jofi::launcher::{build_launch_command, launch};
 use jofi::search::{SearchIndex, SearchResult};
 use jofi::telemetry::{MemorySnapshot, Telemetry, default_telemetry_path};
@@ -38,8 +39,8 @@ struct UiArgs {
     #[arg(long)]
     font: Option<PathBuf>,
 
-    /// Fullscreen background opacity from 0-255.
-    #[arg(long, default_value_t = 205)]
+    /// Fullscreen background opacity from 0-255. Defaults to tofi's #000A alpha.
+    #[arg(long, default_value_t = 170)]
     background_alpha: u8,
 
     /// Query text size in physical pixels.
@@ -49,6 +50,10 @@ struct UiArgs {
     /// Result text size in physical pixels.
     #[arg(long, default_value_t = 28.0)]
     result_size: f32,
+
+    /// Vertical gap between result entries in physical pixels.
+    #[arg(long, default_value_t = 25.0)]
+    result_gap: f32,
 
     /// Maximum visible launcher results.
     #[arg(long, default_value_t = 5)]
@@ -62,6 +67,7 @@ impl From<UiArgs> for UiOptions {
             background_alpha: args.background_alpha,
             query_size_px: args.query_size,
             result_size_px: args.result_size,
+            result_gap_px: args.result_gap,
             max_results: args.ui_results,
         }
     }
@@ -180,11 +186,28 @@ fn main() -> Result<()> {
 }
 
 fn cmd_run(args: UiArgs, options: &DiscoveryOptions, telemetry: Telemetry) -> Result<()> {
-    let index = load_index(options, &telemetry)?;
-    run_launcher(index, telemetry, args.into())
+    let history = load_history(&telemetry)?;
+    let index = load_index_with_history(options, &telemetry, &history)?;
+    run_launcher(index, telemetry, args.into(), history)
+}
+
+fn load_history(telemetry: &Telemetry) -> Result<History> {
+    let mut span = telemetry.span("history.load");
+    let history = History::load_with_tofi_fallback()?;
+    span.set_field("entries", history.len());
+    Ok(history)
 }
 
 fn load_index(options: &DiscoveryOptions, telemetry: &Telemetry) -> Result<SearchIndex> {
+    let history = load_history(telemetry)?;
+    load_index_with_history(options, telemetry, &history)
+}
+
+fn load_index_with_history(
+    options: &DiscoveryOptions,
+    telemetry: &Telemetry,
+    history: &History,
+) -> Result<SearchIndex> {
     let entries = {
         let mut span = telemetry.span("desktop.discover");
         let entries = discover_desktop_entries(options)?;
@@ -194,7 +217,7 @@ fn load_index(options: &DiscoveryOptions, telemetry: &Telemetry) -> Result<Searc
 
     let index = {
         let mut span = telemetry.span("search.index_build");
-        let index = SearchIndex::new(entries);
+        let index = SearchIndex::with_history(entries, history);
         span.set_field("entries", index.len());
         index
     };
@@ -281,6 +304,14 @@ fn cmd_launch(args: LaunchArgs, options: &DiscoveryOptions, telemetry: &Telemetr
         .span("launch.spawn")
         .field("entry", &result.entry.name);
     let child = launch(&result.entry)?;
+    let mut history = History::load_with_tofi_fallback()?;
+    history.increment(&result.entry.name);
+    if let Err(err) = history.save() {
+        let mut fields = Map::new();
+        fields.insert("entry".to_string(), json!(result.entry.name));
+        fields.insert("error".to_string(), json!(err.to_string()));
+        telemetry.event("history.save_error", fields);
+    }
     span.set_field("child_pid", child.id());
     drop(child);
     Ok(())
