@@ -279,9 +279,10 @@ fn score_token(token: &str, field: &str) -> Option<i32> {
     let mut best = None;
     for word in words {
         let max_distance = typo_budget(token);
-        let distance = bounded_damerau_levenshtein(token, word, max_distance)?;
-        let candidate = 6_500 - (distance as i32 * 1_000) - word.len() as i32;
-        best = Some(best.map_or(candidate, |current: i32| current.max(candidate)));
+        if let Some(distance) = bounded_damerau_levenshtein(token, word, max_distance) {
+            let candidate = 6_500 - (distance as i32 * 1_000) - word.len() as i32;
+            best = Some(best.map_or(candidate, |current: i32| current.max(candidate)));
+        }
     }
     if best.is_some() {
         return best;
@@ -402,6 +403,14 @@ mod tests {
         )]);
         let results = index.search("wifi", 5);
         assert_eq!(results[0].entry.name, "Disconnect iPhone Hotspot");
+    }
+
+    #[test]
+    fn typo_checks_all_words_in_field() {
+        let index = SearchIndex::new(vec![entry("Google Chrome", &[])]);
+        let results = index.search("crome", 5);
+        assert_eq!(results[0].entry.name, "Google Chrome");
+        assert!(results[0].reason.contains("crome:name"));
     }
 
     #[test]
