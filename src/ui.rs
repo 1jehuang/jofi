@@ -1,7 +1,7 @@
 //! Native, event-driven layer-shell launcher. All rendering is premultiplied ARGB software text.
 use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
 use smithay_client_toolkit::reexports::{
-    calloop::{EventLoop, LoopHandle},
+    calloop::{channel, EventLoop, LoopHandle},
     calloop_wayland_source::WaylandSource,
 };
 use smithay_client_toolkit::{
@@ -81,6 +81,14 @@ pub fn choose(
     let names = prepare_names()?;
     let search = crate::search::SearchIndex::new(&names);
     let font = pending_font.join().map_err(|_| "font loader panicked")??;
+    let (clipboard_sender, clipboard_receiver) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(clipboard_receiver, |event, _, app: &mut Launcher| {
+            if let channel::Event::Msg(reply) = event {
+                app.clipboard_reply(reply);
+            }
+        })?;
     let mut app = Launcher {
         loop_handle: event_loop.handle(),
         registry: RegistryState::new(&globals),
@@ -99,7 +107,9 @@ pub fn choose(
         font,
         names,
         search,
-        query: String::new(),
+        query: crate::input::Query::default(),
+        clipboard_sender,
+        clipboard_pending: false,
         matches: Vec::new(),
         selected: 0,
         width: 0,
@@ -139,7 +149,9 @@ struct Launcher {
     font: FontArc,
     names: Vec<String>,
     search: crate::search::SearchIndex,
-    query: String,
+    query: crate::input::Query,
+    clipboard_sender: channel::Sender<ClipboardReply>,
+    clipboard_pending: bool,
     matches: Vec<(usize, Vec<usize>, i64)>,
     selected: usize,
     width: u32,
@@ -150,6 +162,22 @@ struct Launcher {
     done: bool,
     answer: Option<usize>,
     failure: Option<String>,
+}
+
+enum ClipboardJob {
+    Copy {
+        text: String,
+        cut: bool,
+        revision: u64,
+    },
+    Paste {
+        revision: u64,
+    },
+}
+struct ClipboardReply {
+    revision: u64,
+    cut: bool,
+    result: Result<Option<String>, String>,
 }
 
 /// Tofi's font-size is in points, whereas ab_glyph's scale is ascent minus
@@ -245,26 +273,103 @@ fn paint_rectangle(
 }
 
 impl Launcher {
+    fn clipboard_request(&mut self, job: ClipboardJob) {
+        // Bound repeated shortcuts to one operation and keep Wayland input and
+        // rendering responsive even if the clipboard owner stops responding.
+        if self.clipboard_pending {
+            return;
+        }
+        self.clipboard_pending = true;
+        let sender = self.clipboard_sender.clone();
+        std::thread::spawn(move || {
+            let reply = match job {
+                ClipboardJob::Copy {
+                    text,
+                    cut,
+                    revision,
+                } => ClipboardReply {
+                    revision,
+                    cut,
+                    result: crate::clipboard::copy(&text).map(|()| None),
+                },
+                ClipboardJob::Paste { revision } => ClipboardReply {
+                    revision,
+                    cut: false,
+                    result: crate::clipboard::paste().map(Some),
+                },
+            };
+            let _ = sender.send(reply);
+        });
+    }
+    fn clipboard_reply(&mut self, reply: ClipboardReply) {
+        self.clipboard_pending = false;
+        if self.done {
+            return;
+        }
+        let changed = match reply.result {
+            Ok(Some(text)) => self.query.paste_if_current(reply.revision, &text),
+            Ok(None) if reply.cut => self.query.cut_if_current(reply.revision),
+            Ok(None) => false,
+            Err(error) => {
+                // In particular, never delete selected text when copying fails.
+                eprintln!("jofi: clipboard: {error}");
+                false
+            }
+        };
+        if changed {
+            self.filter();
+        }
+        self.draw();
+    }
     fn handle_key(&mut self, event: KeyEvent) {
         if self.done {
             return;
         }
         match event.keysym {
             Keysym::Escape => self.done = true,
+            Keysym::Return | Keysym::KP_Enter if self.clipboard_pending => {}
             Keysym::Return | Keysym::KP_Enter => {
                 self.answer = self.matches.get(self.selected).map(|m| m.0);
                 if self.answer.is_some() {
                     self.done = true;
                 }
             }
+            Keysym::a | Keysym::A if self.modifiers.ctrl || self.modifiers.alt => {
+                self.query.select_all();
+            }
+            Keysym::c | Keysym::C | Keysym::x | Keysym::X
+                if self.modifiers.ctrl || self.modifiers.alt =>
+            {
+                if let Some(text) = self.query.selection() {
+                    self.clipboard_request(ClipboardJob::Copy {
+                        text: text.into(),
+                        cut: matches!(event.keysym, Keysym::x | Keysym::X),
+                        revision: self.query.revision,
+                    });
+                }
+            }
+            Keysym::v | Keysym::V if self.modifiers.ctrl || self.modifiers.alt => {
+                self.clipboard_request(ClipboardJob::Paste {
+                    revision: self.query.revision,
+                });
+            }
+            Keysym::BackSpace if self.modifiers.alt || self.modifiers.ctrl => {
+                self.query.delete_word();
+                self.filter();
+            }
+            Keysym::BackSpace | Keysym::Delete if self.query.selected => {
+                self.query.clear();
+                self.filter();
+            }
             Keysym::BackSpace => {
-                self.query.pop();
+                self.query.backspace();
                 self.filter();
             }
             Keysym::u | Keysym::U if self.modifiers.ctrl => {
                 self.query.clear();
                 self.filter();
             }
+            Keysym::Left | Keysym::Right | Keysym::Home | Keysym::End => self.query.deselect(),
             Keysym::Up | Keysym::ISO_Left_Tab => {
                 if !self.matches.is_empty() {
                     self.selected = (self.selected + self.matches.len() - 1) % self.matches.len();
@@ -278,7 +383,7 @@ impl Launcher {
             _ => {
                 if !self.modifiers.ctrl && !self.modifiers.alt && !self.modifiers.logo {
                     if let Some(text) = event.utf8 {
-                        self.query.extend(text.chars().filter(|c| !c.is_control()));
+                        self.query.insert(&text);
                         self.filter();
                     }
                 }
@@ -287,7 +392,7 @@ impl Launcher {
         self.draw();
     }
     fn filter(&mut self) {
-        self.matches = self.search.filter(&self.query);
+        self.matches = self.search.filter(&self.query.text);
         self.selected = 0;
     }
     fn draw(&mut self) {
@@ -318,7 +423,7 @@ impl Launcher {
                 .map(|m| self.names[m.0].as_str())
                 .collect()
         };
-        let extent = std::iter::once(self.query.as_str())
+        let extent = std::iter::once(self.query.text.as_str())
             .chain(rows.iter().copied())
             .map(|text| {
                 text.chars()
@@ -352,6 +457,24 @@ impl Launcher {
         let x = (2.0 * scale).floor() as i32;
         let y = (2.0 * scale).floor() as i32;
         let line = (line_height + 25.0) * scale;
+        let advance: f32 = self
+            .query
+            .text
+            .chars()
+            .map(|ch| glyph_advance(&self.font, font_size, scale, ch))
+            .sum();
+        if self.query.selected {
+            paint_rectangle(
+                canvas,
+                width,
+                height,
+                x,
+                y,
+                advance.ceil() as u32,
+                (line_height * scale).round() as u32,
+                0xff315f88,
+            );
+        }
         paint_text(
             canvas,
             width,
@@ -361,16 +484,11 @@ impl Launcher {
             scale,
             x,
             y,
-            &self.query,
+            &self.query.text,
             0xffffff,
             &[],
         );
         let scaled = self.font.as_scaled(PxScale::from(font_size));
-        let advance: f32 = self
-            .query
-            .chars()
-            .map(|ch| glyph_advance(&self.font, font_size, scale, ch))
-            .sum();
         paint_caret(
             canvas,
             width,

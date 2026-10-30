@@ -47,10 +47,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--jofi', default='target/release/jofi')
     parser.add_argument('--output-dir')
+    parser.add_argument('--remap-alt', action='store_true',
+                        help='Exercise the Alt-to-Ctrl wtype bindings used by the desktop')
     args = parser.parse_args()
-    for tool in ['Xvfb', 'xdotool', 'niri', 'gio']:
+    for tool in ['Xvfb', 'xdotool', 'niri', 'gio', 'wl-copy', 'wl-paste']:
         if shutil.which(tool) is None:
             parser.error(f"Required executable not installed: {tool}")
+    if args.remap_alt and shutil.which('wtype') is None:
+        parser.error('Required executable not installed: wtype')
     original = Path(args.jofi).resolve(strict=True)
     scratch = Path(os.environ.get('JCODE_SCRATCH_DIR', Path.home() / '.jcode/scratch'))
     scratch.mkdir(parents=True, exist_ok=True)
@@ -70,7 +74,7 @@ def main():
     helper = root / 'record-launch.py'
     helper.write_text("import json, pathlib, sys\nwith pathlib.Path(sys.argv[1]).open('a') as f:\n    f.write(json.dumps(sys.argv[2]) + '\\n')\n")
     names = ['Google Chrome', 'Chromium Browser', 'Calculator', 'Visual Studio Code',
-             'Firefox', 'Terminal', 'Terminal Profile', 'Café Notes', 'Code Reference', 'NetworkManager']
+             'Firefox', 'Terminal', 'Terminal Profile', 'Café Notes', 'Code Reference', 'NetworkManager', 'Vesktop']
     entries = {}
     for i, name in enumerate(names):
         path = root / 'data/applications' / f'app-{i}.desktop'
@@ -81,6 +85,15 @@ def main():
         entries[name] = path
     config = root / 'niri.kdl'
     config.write_text('input { keyboard { xkb { layout "us"; }; }; }\nhotkey-overlay { skip-at-startup; }\nanimations { off; }\n')
+    if args.remap_alt:
+        with config.open('a') as configured:
+            configured.write('''binds {
+    Alt+C { spawn "wtype" "-M" "ctrl" "-k" "c" "-m" "ctrl"; }
+    Alt+V { spawn "wtype" "-M" "ctrl" "-k" "v" "-m" "ctrl"; }
+    Alt+A { spawn "sh" "-c" "wtype -M ctrl -k a -m ctrl && wtype -M ctrl -k c -m ctrl"; }
+    Alt+Backspace { spawn "wtype" "-M" "ctrl" "-k" "BackSpace" "-m" "ctrl"; }
+}
+''')
     # FamilyWild Xauthority cookie authorizes only clients that receive this
     # private file. No TCP listener, no access to the active desktop's X server.
     authority = root / 'Xauthority'
@@ -98,7 +111,8 @@ def main():
     xvfb = niri = launcher = None
     logs = []
     result = {'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-              'source_binary': str(original), 'artifact_dir': str(root), 'cases': []}
+              'source_binary': str(original), 'artifact_dir': str(root),
+              'desktop_alt_remapping': args.remap_alt, 'cases': []}
     try:
         read_fd, write_fd = os.pipe()
         xvfb_log = (root / 'xvfb.log').open('wb')
@@ -143,11 +157,13 @@ def main():
         xdo('windowfocus', '--sync', window)
         def launches():
             return [json.loads(line) for line in marker.read_text().splitlines()] if marker.exists() else []
-        def start():
+        def start(extra_env=None):
             nonlocal launcher
             log = (root / f'jofi-{len(result["cases"])}.log').open('wb')
             logs.append(log)
-            launcher = subprocess.Popen([str(binary)], env=dict(env, WAYLAND_DEBUG='client'), stdout=log, stderr=subprocess.STDOUT)
+            launch_env = dict(env, WAYLAND_DEBUG='client')
+            launch_env.update(extra_env or {})
+            launcher = subprocess.Popen([str(binary)], env=launch_env, stdout=log, stderr=subprocess.STDOUT)
             def focused():
                 if launcher.poll() is not None:
                     raise RuntimeError(f'Jofi exited before keyboard focus, see {log.name}')
@@ -161,12 +177,14 @@ def main():
         def key(*keys):
             xdo('key', '--clearmodifiers', *keys)
             time.sleep(0.04)
-        def choose(label, query, expected, keys=()):
+        def choose(label, query, expected, keys=(), edit=None):
             before = launches()
             start()
             type_text(query)
             if keys:
                 key(*keys)
+            if edit:
+                edit()
             key('Return')
             until(lambda: len(launches()) == len(before) + 1, label + ' fixture launch')
             actual = launches()[-1]
@@ -197,6 +215,70 @@ def main():
         choose('Tab selects next result', 'term', 'Terminal Profile', ('Tab',))
         choose('Shift+Tab selects previous result', 'term', 'Terminal Profile', ('shift+Tab',))
         choose('blank query promotes most-used launcher', '', 'Terminal Profile')
+        choose('reported Vesktop double-transposition typo', 'vekstpo', 'Vesktop')
+        choose('reported Firefox mixed typo with second term', 'fireofv x', 'Firefox')
+        choose('Alt+Backspace deletes previous query word', 'ffx unwanted', 'Firefox', ('alt+BackSpace',))
+        choose('Ctrl+Backspace deletes previous query word', 'ffx unwanted', 'Firefox', ('ctrl+BackSpace',))
+
+        def clipboard_text():
+            # This environment always addresses the private nested compositor.
+            pasted = subprocess.run(['wl-paste', '--no-newline', '--type', 'text'],
+                                    env=env, capture_output=True, timeout=3)
+            return pasted.stdout.decode() if pasted.returncode == 0 else None
+
+        for modifier in ['alt', 'ctrl']:
+            def replace_selection():
+                key(modifier + '+a')
+                type_text('ffx')
+            choose(modifier + '+A replaces selected query on typing', 'unmatched',
+                   'Firefox', edit=replace_selection)
+
+            def delete_selection():
+                key(modifier + '+a', 'BackSpace')
+                type_text('ffx')
+            choose(modifier + '+A then Backspace deletes selected query', 'unmatched',
+                   'Firefox', edit=delete_selection)
+
+            def copy_paste_selection():
+                subprocess.run(['wl-copy', '--type', 'text/plain;charset=utf-8'],
+                               input=b'private-test-sentinel', env=env, check=True, timeout=3)
+                key(modifier + '+a', modifier + '+c')
+                until(lambda: clipboard_text() == 'ffx', modifier + ' copied query')
+                key('ctrl+u', modifier + '+v')
+                time.sleep(0.15)
+            choose(modifier + '+C and +V round-trip selected query', 'ffx',
+                   'Firefox', edit=copy_paste_selection)
+            assert clipboard_text() == 'ffx', 'Copied text did not survive Jofi exit'
+
+            def cut_selection():
+                subprocess.run(['wl-copy', '--type', 'text/plain;charset=utf-8'],
+                               input=b'private-test-sentinel', env=env, check=True, timeout=3)
+                key(modifier + '+a', modifier + '+x')
+                until(lambda: clipboard_text() == 'ffx', modifier + ' cut clipboard')
+                time.sleep(0.15)
+                type_text('term')
+            choose(modifier + '+X copies then removes selected query', 'ffx',
+                   'Terminal', edit=cut_selection)
+            assert clipboard_text() == 'ffx', 'Cut text did not survive Jofi exit'
+        # A deliberately failing fixture helper affects this Jofi child only.
+        # Even while a cut is pending, Enter must not launch the old query.
+        helper_bin = root / 'failed-clipboard-helper'
+        helper_bin.mkdir()
+        failed_copy = helper_bin / 'wl-copy'
+        failed_copy.write_text('#!/bin/sh\nsleep 0.5\nexit 1\n')
+        failed_copy.chmod(0o700)
+        before = launches()
+        start({'PATH': str(helper_bin) + os.pathsep + env.get('PATH', '')})
+        type_text('ffx')
+        key('ctrl+a', 'ctrl+x', 'Return')
+        assert launcher.poll() is None and launches() == before, 'Pending cut launched stale query'
+        log_path = root / f'jofi-{len(result["cases"])}.log'
+        until(lambda: b'jofi: clipboard:' in log_path.read_bytes(), 'clipboard failure feedback')
+        key('Return')
+        until(lambda: len(launches()) == len(before) + 1, 'failed cut preserved query')
+        assert launches()[-1] == 'Firefox', 'Failed cut deleted or changed search text'
+        launcher.wait(timeout=5)
+        result['cases'].append({'case': 'failed cut preserves query and pending Enter cannot launch', 'passed': True})
         # Enter on an empty result must not close or accidentally launch the
         # previously selected app. Ctrl+U then searches from a clean selection.
         before = launches()

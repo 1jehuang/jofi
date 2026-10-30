@@ -168,7 +168,7 @@ fn run(label: &str, names: &[String], batches: usize, repeats: usize) {
         );
     }
     println!("  Individual-key latency (101 samples, no batch averaging):");
-    for query in ["term", "chrmoe", "zzzzzz"] {
+    for query in ["term", "chrmoe", "zzzzzz", "vekstpo", "fireofv x"] {
         let old = measure(
             || {
                 black_box(baseline(black_box(names), black_box(query)));

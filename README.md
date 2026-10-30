@@ -125,6 +125,21 @@ GUI launch failures use `notify-send` when available, with details also on stder
 
 Type to filter with subsequence matching and conservative typo tolerance, arrows
 or Tab to select, Enter to launch, Escape to dismiss, and Ctrl+U to clear the query.
+Alt+A selects all query text, Alt+C copies the selection, Alt+X cuts it, and
+Alt+V pastes. Ctrl+A/C/X/V work too, including when a compositor translates the
+Alt keys into Ctrl keys. Typing or Backspace replaces/deletes selected text.
+Alt+Backspace (or Ctrl+Backspace) deletes the previous whitespace-delimited
+query word. Ordinary Backspace deletes one complete Unicode grapheme.
+
+Clipboard shortcuts optionally require `wl-clipboard` (`wl-copy` and `wl-paste`,
+Arch package `wl-clipboard`). Helpers start only on a clipboard shortcut and run
+off the UI thread, with a two-second timeout and a 64 KiB paste limit. Failed
+copy/cut preserves the selected query, and delayed clipboard results never
+overwrite newer edits. Enter is ignored while a clipboard operation is pending
+so it cannot launch a stale result. Copy/cut uses the normal system clipboard,
+which may also be retained by your clipboard manager. The clipboard-owner
+helper can remain alive after Jofi exits to keep copied text available.
+
 Frequently launched entries are promoted on the next opening, with last-use
 time and legacy recent ordering breaking ties. Search relevance still takes
 priority over frequency. Desktop apps, desktop entries that invoke scripts, and
@@ -136,8 +151,9 @@ Usage stays **local only** in `$XDG_STATE_HOME/jofi/usage.tsv` (default
 Unix milliseconds, imported count, and launcher identity. The legacy
 `jofi/recent` file remains available. Storage updates use an advisory lock and
 atomic rename, with private directory/file permissions. There is no telemetry,
-network reporting, or persistent background process. No search text or script
-arguments are saved.
+network reporting, or persistent Jofi daemon. Search text and script arguments
+are never saved to usage state. Only explicit copy/cut writes selected search
+text to the system clipboard.
 
 ```sh
 jofi usage                         # Inspect stored counts and last-launch times
@@ -163,10 +179,11 @@ launcher exits.
 Search uses an indexed optimal fuzzy matcher with word/camel-case bonuses,
 case/accent normalization, and whitespace-separated terms in any order.
 Punctuation is literal. Word-prefix typo recovery allows one edit from four
-characters and two from eight, including adjacent transpositions. Strong fuzzy
+characters and two from seven, including adjacent transpositions. Strong fuzzy
 matches stay first, but a good typo correction beats a weak scattered match:
 `chrmoe` finds Google Chrome before Chromium Browser. Short queries stay strict
-to limit noise. Ranking, filtering benchmarks, and isolated keyboard-to-launch
+to limit noise. Two-error examples `vekstpo` and `fireofv x` find Vesktop and
+Firefox respectively. Ranking, filtering benchmarks, and isolated keyboard-to-launch
 acceptance are documented in `bench/SEARCH.md`.
 
 ## Startup design
