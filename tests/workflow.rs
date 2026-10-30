@@ -99,8 +99,134 @@ fn discover_compile_cache_launch_and_invalidate() {
     assert!(changed.status.success());
     assert_eq!(changed.stdout, b"changed\n");
     fs::write(f.0.join("scripts/hello.rs"), "fn main( broken").unwrap();
+    let counts_before = fs::read(f.0.join("state/jofi/usage.tsv")).unwrap();
+    let broken_launch = f.command().args(["launch", "hello"]).output().unwrap();
+    assert!(!broken_launch.status.success());
+    assert_eq!(
+        fs::read(f.0.join("state/jofi/usage.tsv")).unwrap(),
+        counts_before
+    );
+    let usage = f.command().arg("usage").output().unwrap();
+    assert!(String::from_utf8_lossy(&usage.stdout)
+        .lines()
+        .any(|l| l.starts_with("2\t") && l.contains("/scripts/hello.rs\t")));
     let broken = f.command().arg("build").output().unwrap();
     assert!(!broken.status.success());
+}
+
+#[test]
+fn import_is_explicit_idempotent_and_ambiguity_safe() {
+    let f = Fixture::new();
+    for (file, name) in [
+        ("app", "Unique"),
+        ("one", "Duplicate"),
+        ("two", "Duplicate"),
+    ] {
+        fs::write(
+            f.0.join(format!("data/applications/{file}.desktop")),
+            format!("[Desktop Entry]\nType=Application\nName={name}\nExec=true\n"),
+        )
+        .unwrap();
+    }
+    let history = f.0.join("tofi");
+    let full = f.0.join("data/applications/app.desktop");
+    fs::write(
+        &history,
+        format!(
+            "8 Unique\n8 app.desktop\n8 {}\n20 Duplicate\nbad\n-1 Unique\n",
+            full.display()
+        ),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let output = f
+            .command()
+            .arg("import-tofi")
+            .arg(&history)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("matched 1 entries, skipped 3"));
+    }
+    assert!(f
+        .command()
+        .args(["launch", "Unique"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(f
+        .command()
+        .arg("import-tofi")
+        .arg(&history)
+        .status()
+        .unwrap()
+        .success());
+    let output = f.command().arg("usage").output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(text.lines().count(), 2);
+    assert!(text
+        .lines()
+        .any(|l| l.starts_with("9\t") && l.contains("\t8\t")));
+    fs::write(&history, "10 Unique\n").unwrap();
+    assert!(f
+        .command()
+        .arg("import-tofi")
+        .arg(&history)
+        .status()
+        .unwrap()
+        .success());
+    assert!(
+        String::from_utf8_lossy(&f.command().arg("usage").output().unwrap().stdout)
+            .lines()
+            .any(|l| l.starts_with("11\t") && l.contains("\t10\t"))
+    );
+}
+
+#[test]
+fn desktop_success_failure_and_concurrent_counts() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("data/applications/good.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Good\nExec=/bin/true\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("data/applications/bad.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Bad\nExec=/nonexistent/jofi-do-not-run\n",
+    )
+    .unwrap();
+    assert!(!f
+        .command()
+        .args(["launch", "Bad"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(!f.0.join("state/jofi/usage.tsv").exists());
+    assert!(!f
+        .command()
+        .env("PATH", "")
+        .args(["launch", "Good"])
+        .status()
+        .unwrap()
+        .success());
+    let children: Vec<_> = (0..12)
+        .map(|_| f.command().args(["launch", "Good"]).spawn().unwrap())
+        .collect();
+    for mut child in children {
+        assert!(child.wait().unwrap().success());
+    }
+    let output = f.command().arg("usage").output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("12\t") && line.contains("good.desktop\tGood")),
+        "{text}"
+    );
+    assert!(!text.contains("bad.desktop"));
 }
 
 #[test]

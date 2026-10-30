@@ -4,12 +4,13 @@ mod scripts;
 mod search;
 mod startup;
 mod ui;
+mod usage;
 
 use std::{collections::HashMap, env, fs, path::PathBuf};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn usage() {
-    println!("jofi: minimal native Wayland app launcher\n\n  jofi                      Open launcher\n  jofi list                 List desktop apps and Rust scripts\n  jofi launch NAME [ARGS]   Launch an exact, unambiguous name\n  jofi build [--force]      Precompile Rust launchers\n  jofi paths                Show script and cache locations\n\nRust scripts: ~/.config/jofi/scripts/*.rs (or JOFI_SCRIPTS_DIR)\nOptional first-line metadata: // jofi-name: My app\nKeys: type to search, Up/Down or Tab to select, Enter to launch, Esc to close");
+    println!("jofi: minimal native Wayland app launcher\n\n  jofi                      Open launcher\n  jofi list                 List desktop apps and Rust scripts\n  jofi launch NAME [ARGS]   Launch an exact, unambiguous name\n  jofi build [--force]      Precompile Rust launchers\n  jofi usage                Inspect local usage counts (TSV)\n  jofi import-tofi PATH     Explicitly import Tofi frequency history\n  jofi paths                Show script and cache locations\n\nRust scripts: ~/.config/jofi/scripts/*.rs (or JOFI_SCRIPTS_DIR)\nOptional first-line metadata: // jofi-name: My app\nKeys: type to search, Up/Down or Tab to select, Enter to launch, Esc to close");
 }
 fn identity(entry: &catalog::Entry) -> String {
     match &entry.target {
@@ -20,34 +21,48 @@ fn history_path() -> PathBuf {
     catalog::home_dir("XDG_STATE_HOME", ".local/state").join("jofi/recent")
 }
 fn record(entry: &catalog::Entry) {
-    let path = history_path();
-    let id = identity(entry);
-    if id.contains(['\n', '\r']) {
-        return;
-    }
-    let previous = fs::read_to_string(&path).unwrap_or_default();
-    let lines: Vec<_> = std::iter::once(id.as_str())
-        .chain(previous.lines().filter(|s| *s != id))
-        .take(100)
-        .collect();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    if fs::write(&temporary, lines.join("\n")).is_ok() {
-        let _ = fs::rename(temporary, path);
+    if let Err(error) = usage::record(&identity(entry)) {
+        eprintln!("jofi: could not record usage: {error}");
     }
 }
+fn launch(entry: &catalog::Entry, args: &[String], wait: bool) -> Result<()> {
+    let mut command = catalog::prepare_launch(entry, args)?;
+    let mut child = command.spawn()?;
+    if matches!(entry.target, catalog::Target::Rust(_)) {
+        record(entry);
+        if !wait {
+            return Ok(());
+        }
+    }
+    let status = child.wait()?;
+    if status.success() && matches!(entry.target, catalog::Target::Desktop(_)) {
+        record(entry);
+    }
+    if !status.success() {
+        return Err(format!("launcher process exited {status}").into());
+    }
+    Ok(())
+}
 fn prepare_names(entries: &mut [catalog::Entry], recent: &str) -> Vec<String> {
+    prepare_names_with_usage(entries, recent, &usage::read())
+}
+fn prepare_names_with_usage(
+    entries: &mut [catalog::Entry],
+    recent: &str,
+    usage: &usage::Records,
+) -> Vec<String> {
     let mut ranks = HashMap::new();
     for (rank, id) in recent.lines().enumerate() {
         ranks.entry(id).or_insert(rank);
     }
     entries.sort_by_cached_key(|entry| {
-        ranks
-            .get(identity(entry).as_str())
-            .copied()
-            .unwrap_or(usize::MAX)
+        let id = identity(entry);
+        let record = usage.get(&id);
+        (
+            std::cmp::Reverse(record.map_or(0, |r| r.count)),
+            std::cmp::Reverse(record.map_or(0, |r| r.last)),
+            ranks.get(id.as_str()).copied().unwrap_or(usize::MAX),
+        )
     });
     let mut counts = HashMap::new();
     for entry in entries.iter() {
@@ -85,6 +100,22 @@ fn run() -> Result<()> {
         }
         Some("--version" | "-V") => {
             println!("jofi {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("usage") => {
+            let names: HashMap<_, _> = catalog::discover()
+                .into_iter()
+                .map(|e| (identity(&e), e.name))
+                .collect();
+            println!("count\tlast_used_unix_ms\timported_count\tidentity\tname");
+            for (id, r) in usage::read() {
+                let name = names
+                    .get(&id)
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .replace(['\t', '\n', '\r'], " ");
+                println!("{}\t{}\t{}\t{id}\t{name}", r.count, r.last, r.imported);
+            }
             return Ok(());
         }
         Some("paths") => {
@@ -127,6 +158,13 @@ fn run() -> Result<()> {
     });
     let mut entries = if gui { Vec::new() } else { catalog::discover() };
     match args.first().map(String::as_str) {
+        Some("import-tofi") => {
+            if args.len() != 2 {
+                return Err("usage: jofi import-tofi PATH".into());
+            }
+            let (matched, skipped) = usage::import(std::path::Path::new(&args[1]), &entries)?;
+            println!("matched {matched} entries, skipped {skipped} unmatched, ambiguous or malformed records");
+        }
         Some("list") => {
             for entry in entries {
                 println!(
@@ -174,8 +212,7 @@ fn run() -> Result<()> {
                 )
                 .into());
             }
-            record(matches[0]);
-            catalog::launch(matches[0], &args[2..])?;
+            launch(matches[0], &args[2..], true)?;
         }
         None | Some("run") => {
             // The advisory lock acquired above lives only while the overlay is open.
@@ -194,8 +231,7 @@ fn run() -> Result<()> {
             )?;
             drop(lock);
             if let Some(index) = selection {
-                record(&entries[index]);
-                catalog::launch(&entries[index], &[])?;
+                launch(&entries[index], &[], false)?;
             }
         }
         Some(other) => return Err(format!("unknown command {other:?}, see jofi --help").into()),
@@ -240,7 +276,11 @@ mod tests {
                 target: catalog::Target::Desktop("/zulu.desktop".into()),
             },
         ];
-        let labels = prepare_names(&mut entries, "/browser.rs\n/alpha.desktop\n/browser.rs");
+        let labels = prepare_names_with_usage(
+            &mut entries,
+            "/browser.rs\n/alpha.desktop\n/browser.rs",
+            &usage::Records::new(),
+        );
         assert_eq!(
             labels,
             [
@@ -255,6 +295,54 @@ mod tests {
     }
 
     #[test]
+    fn frequency_then_timestamp_then_legacy_recency() {
+        let mut entries: Vec<_> = ["Alpha", "Beta", "Gamma", "Delta"]
+            .into_iter()
+            .map(|name| catalog::Entry {
+                name: name.into(),
+                target: catalog::Target::Rust(format!("/{name}").into()),
+            })
+            .collect();
+        let mut records = usage::Records::new();
+        records.insert(
+            "/Alpha".into(),
+            usage::Record {
+                count: 2,
+                last: 10,
+                imported: 0,
+            },
+        );
+        records.insert(
+            "/Beta".into(),
+            usage::Record {
+                count: 3,
+                last: 1,
+                imported: 0,
+            },
+        );
+        records.insert(
+            "/Gamma".into(),
+            usage::Record {
+                count: 2,
+                last: 20,
+                imported: 0,
+            },
+        );
+        records.insert(
+            "/Delta".into(),
+            usage::Record {
+                count: 2,
+                last: 20,
+                imported: 0,
+            },
+        );
+        assert_eq!(
+            prepare_names_with_usage(&mut entries, "/Delta\n/Gamma", &records),
+            ["Beta", "Delta", "Gamma", "Alpha"]
+        );
+    }
+
+    #[test]
     fn empty_history_retains_input_order() {
         let mut entries = vec![
             catalog::Entry {
@@ -266,6 +354,9 @@ mod tests {
                 target: catalog::Target::Rust("/zulu.rs".into()),
             },
         ];
-        assert_eq!(prepare_names(&mut entries, ""), ["Alpha", "Zulu"]);
+        assert_eq!(
+            prepare_names_with_usage(&mut entries, "", &usage::Records::new()),
+            ["Alpha", "Zulu"]
+        );
     }
 }
