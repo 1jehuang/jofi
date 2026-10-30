@@ -31,6 +31,10 @@ use wayland_client::{
     protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
@@ -65,11 +69,17 @@ pub fn choose(
     // Synchronized child commits become visible atomically with the parent.
     let viewporter: WpViewporter = globals.bind(&qh, 1..=1, ())?;
     let viewport = viewporter.get_viewport(layer.wl_surface(), &qh, ());
+    let content_viewport = viewporter.get_viewport(&content, &qh, ());
+    let fractional_manager: Option<WpFractionalScaleManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let fractional_scale = fractional_manager
+        .as_ref()
+        .map(|manager| manager.get_fractional_scale(layer.wl_surface(), &qh, ()));
     layer.commit();
     let pool = SlotPool::new(4096, &shm)?;
     conn.flush()?;
     crate::startup::mark("Wayland initialized and layer configure requested");
     let names = prepare_names()?;
+    let search = crate::search::SearchIndex::new(&names);
     let font = pending_font.join().map_err(|_| "font loader panicked")??;
     let mut app = Launcher {
         loop_handle: event_loop.handle(),
@@ -82,9 +92,13 @@ pub fn choose(
         subsurface,
         content,
         viewport,
+        content_viewport,
+        _fractional_scale: fractional_scale,
+        fractional_scale: None,
         background_attached: false,
         font,
         names,
+        search,
         query: String::new(),
         matches: Vec::new(),
         selected: 0,
@@ -118,9 +132,13 @@ struct Launcher {
     subsurface: wayland_client::protocol::wl_subsurface::WlSubsurface,
     content: wl_surface::WlSurface,
     viewport: WpViewport,
+    content_viewport: WpViewport,
+    _fractional_scale: Option<WpFractionalScaleV1>,
+    fractional_scale: Option<u32>,
     background_attached: bool,
     font: FontArc,
     names: Vec<String>,
+    search: crate::search::SearchIndex,
     query: String,
     matches: Vec<(usize, Vec<usize>, i64)>,
     selected: usize,
@@ -134,101 +152,35 @@ struct Launcher {
     failure: Option<String>,
 }
 
-/// Subsequence matches always outrank typo fallbacks, retaining their original scoring.
-fn fuzzy(name: &str, query: &str) -> Option<(Vec<usize>, i64)> {
-    subsequence(name, query).or_else(|| typo_match(name, query))
+/// Tofi's font-size is in points, whereas ab_glyph's scale is ascent minus
+/// descent, not pixels per em. Match Pango's 96-DPI point conversion and its
+/// separately rounded ascent/descent for logical line boxes.
+fn text_metrics(font: &FontArc) -> (f32, f32, f32) {
+    let size = font
+        .pt_to_px_scale(24.0)
+        .expect("valid font units per em")
+        .y;
+    let scaled = font.as_scaled(size);
+    let ascent = scaled.ascent().ceil();
+    let height = ascent + (-scaled.descent()).ceil();
+    (size, ascent, height)
 }
 
-/// Case-insensitive Unicode subsequence match. Positions are character indices, never byte offsets.
-fn subsequence(name: &str, query: &str) -> Option<(Vec<usize>, i64)> {
-    let hay: Vec<char> = name.chars().collect();
-    let needle: Vec<char> = query.chars().collect();
-    let mut positions = Vec::new();
-    let mut next = 0;
-    let mut score = 0;
-    for wanted in needle {
-        let found = (next..hay.len()).find(|&i| hay[i].to_lowercase().eq(wanted.to_lowercase()))?;
-        score += (found - next) as i64 * 4;
-        if positions.is_empty() {
-            score += found as i64 * 3;
-        }
-        if found == 0 || !hay[found - 1].is_alphanumeric() {
-            score -= 5;
-        }
-        positions.push(found);
-        next = found + 1;
-    }
-    Some((positions, score))
-}
-
-/// A conservative word-level edit fallback, including adjacent transpositions.
-/// Short queries remain subsequence-only to avoid flooding the result list.
-fn typo_match(name: &str, query: &str) -> Option<(Vec<usize>, i64)> {
-    let needle: Vec<char> = query
-        .chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect();
-    if needle.len() < 4 {
-        return None;
-    }
-    let limit = if needle.len() >= 8 { 2 } else { 1 };
-    let chars: Vec<char> = name.chars().collect();
-    let mut ranges = vec![(0, chars.len())];
-    let mut start = 0;
-    for end in 0..=chars.len() {
-        if end == chars.len() || !chars[end].is_alphanumeric() {
-            if start < end {
-                ranges.push((start, end));
-            }
-            start = end + 1;
-        }
-    }
-    ranges
-        .into_iter()
-        .filter_map(|(start, end)| {
-            if (end - start).abs_diff(needle.len()) > limit {
-                return None;
-            }
-            let word: Vec<char> = chars[start..end]
-                .iter()
-                .map(|c| c.to_lowercase().next().unwrap_or(*c))
-                .collect();
-            let distance = edit_distance(&word, &needle);
-            if distance > limit {
-                return None;
-            }
-            let positions = (start..end)
-                .filter(|&i| needle.contains(&chars[i].to_lowercase().next().unwrap_or(chars[i])))
-                .collect();
-            Some((
-                positions,
-                i64::MAX / 2 + distance as i64 * 100 + start as i64,
-            ))
-        })
-        .min_by_key(|entry| entry.1)
-}
-
-fn edit_distance(left: &[char], right: &[char]) -> usize {
-    let mut previous_previous = Vec::new();
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    for (i, a) in left.iter().enumerate() {
-        let mut row = vec![i + 1; right.len() + 1];
-        for (j, b) in right.iter().enumerate() {
-            row[j + 1] = (previous[j + 1] + 1)
-                .min(row[j] + 1)
-                .min(previous[j] + usize::from(a != b));
-            if i > 0 && j > 0 && *a == right[j - 1] && left[i - 1] == *b {
-                row[j + 1] = row[j + 1].min(previous_previous[j - 1] + 1);
-            }
-        }
-        previous_previous = previous;
-        previous = row;
-    }
-    previous[right.len()]
+fn glyph_advance(font: &FontArc, size: f32, scale: f32, ch: char) -> f32 {
+    let scaled = font.as_scaled(size);
+    // Pango's default round-glyph-positions operates in logical pixels,
+    // before the surface's fractional device scale is applied.
+    (scaled.h_advance(scaled.glyph_id(ch)) / scale).round() * scale
 }
 
 /// Logical coordinates leave a small ink-bearing margin and clip to the output.
-fn content_layout(width: u32, height: u32, text_width: f32, rows: usize) -> (i32, i32, u32, u32) {
+fn content_layout(
+    width: u32,
+    height: u32,
+    text_width: f32,
+    rows: usize,
+    line_height: f32,
+) -> (i32, i32, u32, u32) {
     let x = (width as f32 * 0.35) as u32;
     let y = (height as f32 * 0.35) as u32;
     let left = x.saturating_sub(2);
@@ -237,7 +189,10 @@ fn content_layout(width: u32, height: u32, text_width: f32, rows: usize) -> (i32
         .saturating_add(28)
         .min(width - left)
         .max(1);
-    let h = (rows as u32 * 49 + 28).min(height - top).max(1);
+    let h = ((rows as f32 * (line_height + 25.0) + line_height).ceil() as u32)
+        .saturating_add(4)
+        .min(height - top)
+        .max(1);
     (left as i32, top as i32, w, h)
 }
 
@@ -250,18 +205,41 @@ fn paint_caret(
     thickness: u32,
     caret_height: u32,
 ) {
+    paint_rectangle(
+        canvas,
+        width,
+        height,
+        x,
+        y,
+        thickness,
+        caret_height,
+        0xffff4500,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_rectangle(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    rect_width: u32,
+    rect_height: u32,
+    color: u32,
+) {
     let left = i64::from(x).max(0).min(i64::from(width));
-    let right = (i64::from(x) + i64::from(thickness))
+    let right = (i64::from(x) + i64::from(rect_width))
         .max(0)
         .min(i64::from(width));
     let top = i64::from(y).max(0).min(i64::from(height));
-    let bottom = (i64::from(y) + i64::from(caret_height))
+    let bottom = (i64::from(y) + i64::from(rect_height))
         .max(0)
         .min(i64::from(height));
     for py in top..bottom {
         for px in left..right {
             let offset = (py as usize * width as usize + px as usize) * 4;
-            canvas[offset..offset + 4].copy_from_slice(&0xffff4500u32.to_ne_bytes());
+            canvas[offset..offset + 4].copy_from_slice(&color.to_ne_bytes());
         }
     }
 }
@@ -309,15 +287,7 @@ impl Launcher {
         self.draw();
     }
     fn filter(&mut self) {
-        self.matches = self
-            .names
-            .iter()
-            .enumerate()
-            .filter_map(|(index, name)| {
-                fuzzy(name, &self.query).map(|(positions, score)| (index, positions, score))
-            })
-            .collect();
-        self.matches.sort_by_key(|entry| (entry.2, entry.0));
+        self.matches = self.search.filter(&self.query);
         self.selected = 0;
     }
     fn draw(&mut self) {
@@ -331,9 +301,12 @@ impl Launcher {
     }
     fn render(&mut self) -> Result<(), Box<dyn Error>> {
         crate::startup::mark("render begin");
-        let scale = self.scale.max(1) as u32;
-        let font_size = 24.0 * scale as f32;
-        let scaled = self.font.as_scaled(PxScale::from(font_size));
+        let scale = self
+            .fractional_scale
+            .map(|n| n as f32 / 120.0)
+            .unwrap_or(self.scale.max(1) as f32);
+        let (logical_size, _, line_height) = text_metrics(&self.font);
+        let font_size = logical_size * scale;
         let start = self.selected.saturating_sub(4);
         let rows: Vec<&str> = if self.matches.is_empty() {
             vec!["No matches"]
@@ -349,18 +322,19 @@ impl Launcher {
             .chain(rows.iter().copied())
             .map(|text| {
                 text.chars()
-                    .map(|c| scaled.h_advance(scaled.glyph_id(c)))
+                    .map(|c| glyph_advance(&self.font, font_size, scale, c))
                     .sum::<f32>()
             })
             .fold(0.0_f32, f32::max);
-        let (left, top, logical_width, logical_height) =
-            content_layout(self.width, self.height, extent / scale as f32, rows.len());
-        let width = logical_width
-            .checked_mul(scale)
-            .ok_or("surface width overflow")?;
-        let height = logical_height
-            .checked_mul(scale)
-            .ok_or("surface height overflow")?;
+        let (left, top, logical_width, logical_height) = content_layout(
+            self.width,
+            self.height,
+            extent / scale,
+            rows.len(),
+            line_height,
+        );
+        let width = (logical_width as f32 * scale).round().max(1.0) as u32;
+        let height = (logical_height as f32 * scale).round().max(1.0) as u32;
         let stride = width
             .checked_mul(4)
             .filter(|&n| n <= i32::MAX as u32)
@@ -375,15 +349,16 @@ impl Launcher {
             wl_shm::Format::Argb8888,
         )?;
         canvas.fill(0);
-        let x = 2 * scale as i32;
-        let y = 2 * scale as i32;
-        let line = (font_size + 25.0 * scale as f32) as i32;
+        let x = (2.0 * scale).floor() as i32;
+        let y = (2.0 * scale).floor() as i32;
+        let line = (line_height + 25.0) * scale;
         paint_text(
             canvas,
             width,
             height,
             &self.font,
             font_size,
+            scale,
             x,
             y,
             &self.query,
@@ -394,7 +369,7 @@ impl Launcher {
         let advance: f32 = self
             .query
             .chars()
-            .map(|ch| scaled.h_advance(scaled.glyph_id(ch)))
+            .map(|ch| glyph_advance(&self.font, font_size, scale, ch))
             .sum();
         paint_caret(
             canvas,
@@ -402,8 +377,8 @@ impl Launcher {
             height,
             x.saturating_add(advance.round() as i32),
             y,
-            3 * scale,
-            font_size.ceil() as u32,
+            (3.0 * scale).round() as u32,
+            (line_height * scale).round() as u32,
         );
         if self.matches.is_empty() {
             paint_text(
@@ -412,8 +387,9 @@ impl Launcher {
                 height,
                 &self.font,
                 font_size,
+                scale,
                 x,
-                y + line,
+                y + line.round() as i32,
                 "No matches",
                 0xffffff,
                 &[],
@@ -422,10 +398,47 @@ impl Launcher {
             let start = self.selected.saturating_sub(4);
             for (row, (index, positions, _)) in self.matches.iter().skip(start).take(5).enumerate()
             {
+                let row_y = y + (line * (row as f32 + 1.0)).round() as i32;
+                if start + row == self.selected {
+                    // Tofi paints the selected background over the existing
+                    // dimmer, with zero padding and the text's ink width.
+                    let mut cursor = x as f32;
+                    let mut ink_left = f32::INFINITY;
+                    let mut ink_right = f32::NEG_INFINITY;
+                    for ch in self.names[*index].chars() {
+                        let id = scaled.glyph_id(ch);
+                        let glyph = id.with_scale_and_position(
+                            font_size,
+                            point(cursor, row_y as f32 + scaled.ascent()),
+                        );
+                        if let Some(outline) = self.font.outline_glyph(glyph) {
+                            let bounds = outline.px_bounds();
+                            ink_left = ink_left.min(bounds.min.x);
+                            ink_right = ink_right.max(bounds.max.x);
+                        }
+                        cursor += glyph_advance(&self.font, font_size, scale, ch);
+                    }
+                    if ink_right > ink_left {
+                        paint_rectangle(
+                            canvas,
+                            width,
+                            height,
+                            ink_left.floor() as i32,
+                            y + (line * (row as f32 + 1.0)).round() as i32,
+                            (ink_right.ceil() - ink_left.floor()) as u32,
+                            (line_height * scale).round() as u32,
+                            0xaa000000,
+                        );
+                    }
+                }
                 let color = if start + row == self.selected {
                     0xff6347
                 } else {
-                    0xffffff
+                    if (start + row) % 2 == 1 {
+                        0xf0f0f0
+                    } else {
+                        0xffffff
+                    }
                 };
                 paint_text(
                     canvas,
@@ -433,15 +446,18 @@ impl Launcher {
                     height,
                     &self.font,
                     font_size,
+                    scale,
                     x,
-                    y + line * (row as i32 + 1),
+                    row_y,
                     &self.names[*index],
                     color,
                     positions,
                 );
             }
         }
-        self.content.set_buffer_scale(self.scale.max(1));
+        self.content.set_buffer_scale(1);
+        self.content_viewport
+            .set_destination(logical_width as i32, logical_height as i32);
         self.subsurface.set_position(left, top);
         self.content
             .damage_buffer(0, 0, width as i32, height as i32);
@@ -471,6 +487,7 @@ fn paint_text(
     height: u32,
     font: &FontArc,
     size: f32,
+    scale: f32,
     x: i32,
     y: i32,
     text: &str,
@@ -510,7 +527,7 @@ fn paint_text(
                 canvas[offset..offset + 4].copy_from_slice(&result.to_ne_bytes());
             });
         }
-        cursor += scaled.h_advance(id);
+        cursor += glyph_advance(font, size, scale, character);
         if cursor >= width as f32 {
             break;
         }
@@ -555,6 +572,21 @@ impl CompositorHandler for Launcher {
         _: &wl_surface::WlSurface,
         _: &wl_output::WlOutput,
     ) {
+    }
+}
+impl wayland_client::Dispatch<WpFractionalScaleV1, ()> for Launcher {
+    fn event(
+        state: &mut Self,
+        _: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.fractional_scale = Some(scale.max(1));
+            state.draw();
+        }
     }
 }
 impl OutputHandler for Launcher {
@@ -691,6 +723,7 @@ impl ProvidesRegistryState for Launcher {
 delegate_subcompositor!(Launcher);
 wayland_client::delegate_noop!(Launcher: ignore WpViewporter);
 wayland_client::delegate_noop!(Launcher: ignore WpViewport);
+wayland_client::delegate_noop!(Launcher: ignore WpFractionalScaleManagerV1);
 delegate_compositor!(Launcher);
 delegate_output!(Launcher);
 delegate_shm!(Launcher);
@@ -701,15 +734,32 @@ delegate_registry!(Launcher);
 
 #[cfg(test)]
 mod tests {
-    use super::{content_layout, fuzzy, paint_caret, paint_text, subsequence};
+    use super::{content_layout, glyph_advance, paint_caret, paint_text, text_metrics};
+    use ab_glyph::{Font, ScaleFont};
+
+    #[test]
+    fn theme_uses_points_and_logical_pixel_glyph_advances() {
+        let font = crate::font::load().unwrap();
+        let (size, ascent, height) = text_metrics(&font);
+        let px_per_em = size * font.units_per_em().unwrap() / font.height_unscaled();
+        assert!((px_per_em - 32.0).abs() < 0.001);
+        assert_eq!(ascent, font.as_scaled(size).ascent().ceil());
+        assert_eq!(height, ascent + (-font.as_scaled(size).descent()).ceil());
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            assert_eq!(
+                glyph_advance(&font, size * scale, scale, 'M'),
+                font.as_scaled(size).h_advance(font.glyph_id('M')).round() * scale
+            );
+        }
+    }
     #[test]
     fn content_bounds_preserve_origin_and_clip_long_text() {
-        let (x, y, w, h) = content_layout(1646, 1029, 200.0, 5);
+        let (x, y, w, h) = content_layout(1646, 1029, 200.0, 5, 44.0);
         assert_eq!((x + 2, y + 2), (576, 360));
-        assert_eq!((w, h), (228, 273));
+        assert_eq!((w, h), (228, 393));
         assert!(w * h * 4 < 1646 * 1029);
         for (width, height) in [(1, 1), (3, 2), (100, 40), (1646, 1029)] {
-            let (x, y, w, h) = content_layout(width, height, f32::MAX, 5);
+            let (x, y, w, h) = content_layout(width, height, f32::MAX, 5, 44.0);
             assert!(w > 0 && h > 0);
             assert!(x as u32 + w <= width && y as u32 + h <= height);
         }
@@ -723,7 +773,19 @@ mod tests {
             (0xffffff, vec![0], 0xff4500),
         ] {
             let mut pixels = vec![0; 64 * 40 * 4];
-            paint_text(&mut pixels, 64, 40, &font, 24.0, 2, 2, "M", color, &matches);
+            paint_text(
+                &mut pixels,
+                64,
+                40,
+                &font,
+                24.0,
+                1.0,
+                2,
+                2,
+                "M",
+                color,
+                &matches,
+            );
             assert!(pixels
                 .as_chunks::<4>()
                 .0
@@ -738,38 +800,6 @@ mod tests {
             }
             assert_eq!(&pixels[..4], &[0; 4]);
         }
-    }
-    #[test]
-    fn transposed_typo_matches_app_and_word() {
-        assert_eq!(fuzzy("Chrome", "chrmoe").unwrap().0, vec![0, 1, 2, 3, 4, 5]);
-        assert_eq!(
-            fuzzy("Google Chrome", "chrmoe").unwrap().0,
-            vec![7, 8, 9, 10, 11, 12]
-        );
-        assert!(fuzzy("Chrome", "zzzzzz").is_none());
-        assert!(fuzzy("Chrome", "crm").is_some());
-        assert!(fuzzy("Chrome", "xro").is_none());
-    }
-    #[test]
-    fn subsequence_rank_is_preserved_and_beats_typos() {
-        for (name, query) in [
-            ("Chrome", "chrm"),
-            ("Firefox", "ffx"),
-            ("Terminal", "term"),
-            ("Éclair 🦀 Rust", "é🦀r"),
-        ] {
-            assert_eq!(fuzzy(name, query), subsequence(name, query));
-        }
-        assert!(
-            fuzzy("chrmoe subsequence", "chrmoe").unwrap().1 < fuzzy("Chrome", "chrmoe").unwrap().1
-        );
-    }
-    #[test]
-    fn typo_unicode_positions_remain_character_indices() {
-        assert_eq!(
-            fuzzy("🦀 Éclair", "écliar").unwrap().0,
-            vec![2, 3, 4, 5, 6, 7]
-        );
     }
     #[test]
     fn caret_is_three_pixels_wide_and_clips_safely() {
@@ -788,21 +818,5 @@ mod tests {
         );
         paint_caret(&mut pixels, 8, 6, -2, -1, 3, 2);
         paint_caret(&mut pixels, 8, 6, i32::MAX, i32::MAX, 3, 24);
-    }
-    #[test]
-    fn unicode_positions_are_characters() {
-        assert_eq!(fuzzy("Éclair 🦀 Rust", "é🦀r").unwrap().0, vec![0, 7, 9]);
-    }
-    #[test]
-    fn subsequences_and_empty() {
-        assert!(fuzzy("Firefox", "ffx").is_some());
-        assert!(fuzzy("Firefox", "z").is_none());
-        assert_eq!(fuzzy("anything", "").unwrap().0, Vec::<usize>::new());
-    }
-    #[test]
-    fn contiguous_match_ranks_first() {
-        assert!(
-            fuzzy("terminal", "term").unwrap().1 < fuzzy("the error manager", "term").unwrap().1
-        );
     }
 }

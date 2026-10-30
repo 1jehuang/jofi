@@ -15,10 +15,22 @@ rendering, and no browser engine, GPU toolkit, or background daemon.
   need a `.desktop` file or installation into a standard app directory.
   Override the directory with `JOFI_SCRIPTS_DIR`.
 
-The default UI matches the existing tofi setup: fullscreen translucent black,
-monospace white text, tomato selection, orange-red matches, 35% left/top inset,
-and five visible results. Uses the `launcher` layer namespace so an existing
+The default UI follows the existing tofi setup: fullscreen translucent black,
+24-point monospace white text, tomato selection, orange-red matches, 35%
+left/top inset, and five visible results with 25 logical pixels between line
+boxes. Font sizes use point-to-em conversion, not ab_glyph's line-height scale.
+Fractional display scaling renders directly at the preferred scale, with an
+integer-scale fallback. Selection backgrounds and alternating result colors
+follow the tofi theme. Uses the `launcher` layer namespace so an existing
 niri blur rule matching `^(tofi|launcher)$` also applies to Jofi.
+
+`bench/compare-appearance.py` captures both launchers without selecting an app
+and measures foreground pixel bounds. Screenshots remain private under
+`~/.jcode/scratch`. On the 1.75× display, the calibrated same-label comparison
+matched tofi's cursor bounds exactly (1008, 630 through 1012, 708), and matched
+all five result rows' horizontal ink bounds. Rasterization is not pixel-identical:
+ab_glyph and tofi's Pango/Cairo differ in hinting and antialiasing, with measured
+vertical ink-bound differences of up to two physical pixels.
 
 ## Build and install
 
@@ -117,8 +129,9 @@ real text-buffer submission, including the synchronized parent commit, not just
 the one-pixel background. It includes process launch and Wayland debug overhead,
 but is not a measurement of physical screen presentation.
 
-On October 30, 2026, 30 interleaved warm trials per launcher (three warmups)
-on the current niri session measured:
+On October 30, 2026, before correcting the font from the undersized 24-pixel
+line-height scale to tofi's 24-point size, 30 interleaved warm trials per launcher
+(three warmups) on the current niri session measured:
 
 | Launcher | Median content submission | p95 | Median RSS |
 | --- | ---: | ---: | ---: |
@@ -126,8 +139,13 @@ on the current niri session measured:
 | Original Jofi | 21.95 ms | 25.48 ms | 31.00 MiB |
 | tofi-drun | 18.31 ms | 22.01 ms | 57.27 MiB |
 
-The warm median meets the 5 ms content-submission target, not a 5 ms worst-case
-or input-readiness guarantee. Median content plus keyboard focus was 7.44 ms.
+The earlier warm median met the 5 ms content-submission target, not a 5 ms
+worst-case or input-readiness guarantee. It does not describe the corrected,
+larger typography. After matching tofi's sizing and integrating indexed search,
+a new 30-trial comparison measured 7.92 ms median Jofi content submission versus
+26.44 ms for tofi-drun on the same running desktop (p95 25.67 ms versus 36.15 ms).
+Median content plus keyboard focus was 12.86 ms. These runs were noisy, so they
+are observations rather than a guarantee or an isolated attribution of cost.
 A first launch after cache invalidation must perform native font matching and
 write the dependency manifest, so these warm figures do not describe cold opens.
 
