@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Preserve the launch-origin context used by local desktop-entry helpers.
+set -u
+origin=$(niri msg -j focused-window 2>/dev/null || true)
+if [[ -n "$origin" ]]; then
+    export JSTACK_ORIGIN_WINDOW_ID JSTACK_ORIGIN_WINDOW_PID
+    export JSTACK_ORIGIN_WINDOW_APP_ID JSTACK_ORIGIN_WORKSPACE_ID
+    JSTACK_ORIGIN_WINDOW_ID=$(jq -r '.id // empty' <<<"$origin")
+    JSTACK_ORIGIN_WINDOW_PID=$(jq -r '.pid // empty' <<<"$origin")
+    JSTACK_ORIGIN_WINDOW_APP_ID=$(jq -r '.app_id // empty' <<<"$origin")
+    JSTACK_ORIGIN_WORKSPACE_ID=$(jq -r '.workspace_id // empty' <<<"$origin")
+fi
+workspace=$(niri msg -j workspaces 2>/dev/null | jq -r '.[] | select(.is_focused) | (.name // .idx)' || true)
+# Jofi uses its own advisory lock, never kill another launcher or prompt.
+"${JOFI_BIN:-jofi}" "$@"
+status=$?
+if [[ $status -eq 0 && -n "$workspace" ]]; then
+    niri msg action focus-workspace "$workspace" >/dev/null 2>&1 || true
+fi
+exit "$status"
