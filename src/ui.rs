@@ -321,7 +321,7 @@ impl Launcher {
             stride as i32,
             wl_shm::Format::Argb8888,
         )?;
-        for pixel in canvas.chunks_exact_mut(4) {
+        for pixel in canvas.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&0xaa000000u32.to_ne_bytes());
         }
         let font_size = 24.0 * scale as f32;
@@ -670,8 +670,10 @@ mod tests {
         let mut pixels = vec![0; 8 * 6 * 4];
         paint_caret(&mut pixels, 8, 6, 2, 1, 3, 4);
         let count = pixels
-            .chunks_exact(4)
-            .filter(|p| u32::from_ne_bytes((*p).try_into().unwrap()) == 0xffff4500)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| u32::from_ne_bytes(**p) == 0xffff4500)
             .count();
         assert_eq!(count, 12);
         assert_eq!(
