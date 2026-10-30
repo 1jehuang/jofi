@@ -211,3 +211,19 @@ These are filter timings, not clipboard or GUI latency. The original baseline
 does not recover the reported two-error examples, so output sets differ.
 The earlier tables remain historical measurements of the earlier policy, not
 claims about the current executable or controlled before/after attribution.
+
+## Ctrl/Super J/K navigation
+
+The `27a7567` follow-up adds Ctrl+J and Super+J for next entry, and Ctrl+K and
+Super+K for previous entry. Both directions wrap, while unmodified letters
+remain search input. The installed release passed **34 real workflow cases**
+with desktop Alt remapping, including eight next/previous/wrapping scenarios
+and navigation with an empty result list. Existing clipboard and typo cases
+remain covered. The matcher implementation is unchanged; filtering performance
+was not remeasured for this navigation-only update.
+
+Hosted check `20261030-032559395-1358110`, full tests
+`20261030-032600130-1358157` (52 passed, 1 ignored), strict all-target Clippy
+`20261030-032602432-1358293`, and explicit hosted release
+`20261030-032603566-1358688` all passed. Installed binary SHA256:
+`3bf8d0986bfc327e980a0c03d1f01ca663f10eb1c58a6769821c206b5ed09d89`.
