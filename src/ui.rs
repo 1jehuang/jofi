@@ -24,23 +24,22 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::{error::Error, process::Command};
+use smithay_client_toolkit::{delegate_subcompositor, subcompositor::SubcompositorState};
+use std::error::Error;
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 
 /// Show the launcher, returning the original input index, or None on cancellation.
-pub fn choose(names: &[String]) -> Result<Option<usize>, Box<dyn Error>> {
-    let font_path = Command::new("fc-match")
-        .args(["-f", "%{file}", "monospace"])
-        .output()?;
-    if !font_path.status.success() {
-        return Err("fc-match could not find a monospace font".into());
-    }
-    let path = String::from_utf8(font_path.stdout)?;
-    let font = FontArc::try_from_vec(std::fs::read(path.trim())?)?;
+pub fn choose(
+    names: &[String],
+    pending_font: crate::font::Pending,
+) -> Result<Option<usize>, Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, queue) = registry_queue_init(&conn)?;
     let mut event_loop: EventLoop<Launcher> = EventLoop::try_new()?;
@@ -60,8 +59,16 @@ pub fn choose(names: &[String]) -> Result<Option<usize>, Box<dyn Error>> {
     layer.set_size(0, 0);
     layer.set_exclusive_zone(-1);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    let subcompositor =
+        SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)?;
+    let (subsurface, content) = subcompositor.create_subsurface(layer.wl_surface().clone(), &qh);
+    // Synchronized child commits become visible atomically with the parent.
+    let viewporter: WpViewporter = globals.bind(&qh, 1..=1, ())?;
+    let viewport = viewporter.get_viewport(layer.wl_surface(), &qh, ());
     layer.commit();
     let pool = SlotPool::new(4096, &shm)?;
+    conn.flush()?;
+    let font = pending_font.join().map_err(|_| "font loader panicked")??;
     let mut app = Launcher {
         loop_handle: event_loop.handle(),
         registry: RegistryState::new(&globals),
@@ -70,6 +77,10 @@ pub fn choose(names: &[String]) -> Result<Option<usize>, Box<dyn Error>> {
         shm,
         pool,
         layer,
+        subsurface,
+        content,
+        viewport,
+        background_attached: false,
         font,
         names: names.to_vec(),
         query: String::new(),
@@ -102,6 +113,10 @@ struct Launcher {
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
+    subsurface: wayland_client::protocol::wl_subsurface::WlSubsurface,
+    content: wl_surface::WlSurface,
+    viewport: WpViewport,
+    background_attached: bool,
     font: FontArc,
     names: Vec<String>,
     query: String,
@@ -210,6 +225,20 @@ fn edit_distance(left: &[char], right: &[char]) -> usize {
     previous[right.len()]
 }
 
+/// Logical coordinates leave a small ink-bearing margin and clip to the output.
+fn content_layout(width: u32, height: u32, text_width: f32, rows: usize) -> (i32, i32, u32, u32) {
+    let x = (width as f32 * 0.35) as u32;
+    let y = (height as f32 * 0.35) as u32;
+    let left = x.saturating_sub(2);
+    let top = y.saturating_sub(2);
+    let w = (text_width.ceil() as u32)
+        .saturating_add(28)
+        .min(width - left)
+        .max(1);
+    let h = (rows as u32 * 49 + 28).min(height - top).max(1);
+    (left as i32, top as i32, w, h)
+}
+
 fn paint_caret(
     canvas: &mut [u8],
     width: u32,
@@ -299,13 +328,35 @@ impl Launcher {
         }
     }
     fn render(&mut self) -> Result<(), Box<dyn Error>> {
+        crate::startup::mark("render begin");
         let scale = self.scale.max(1) as u32;
-        let width = self
-            .width
+        let font_size = 24.0 * scale as f32;
+        let scaled = self.font.as_scaled(PxScale::from(font_size));
+        let start = self.selected.saturating_sub(4);
+        let rows: Vec<&str> = if self.matches.is_empty() {
+            vec!["No matches"]
+        } else {
+            self.matches
+                .iter()
+                .skip(start)
+                .take(5)
+                .map(|m| self.names[m.0].as_str())
+                .collect()
+        };
+        let extent = std::iter::once(self.query.as_str())
+            .chain(rows.iter().copied())
+            .map(|text| {
+                text.chars()
+                    .map(|c| scaled.h_advance(scaled.glyph_id(c)))
+                    .sum::<f32>()
+            })
+            .fold(0.0_f32, f32::max);
+        let (left, top, logical_width, logical_height) =
+            content_layout(self.width, self.height, extent / scale as f32, rows.len());
+        let width = logical_width
             .checked_mul(scale)
             .ok_or("surface width overflow")?;
-        let height = self
-            .height
+        let height = logical_height
             .checked_mul(scale)
             .ok_or("surface height overflow")?;
         let stride = width
@@ -321,12 +372,9 @@ impl Launcher {
             stride as i32,
             wl_shm::Format::Argb8888,
         )?;
-        for pixel in canvas.as_chunks_mut::<4>().0 {
-            pixel.copy_from_slice(&0xaa000000u32.to_ne_bytes());
-        }
-        let font_size = 24.0 * scale as f32;
-        let x = (width as f32 * 0.35) as i32;
-        let y = (height as f32 * 0.35) as i32;
+        canvas.fill(0);
+        let x = 2 * scale as i32;
+        let y = 2 * scale as i32;
         let line = (font_size + 25.0 * scale as f32) as i32;
         paint_text(
             canvas,
@@ -391,12 +439,25 @@ impl Launcher {
                 );
             }
         }
-        self.layer.wl_surface().set_buffer_scale(self.scale.max(1));
+        self.content.set_buffer_scale(self.scale.max(1));
+        self.subsurface.set_position(left, top);
+        self.content
+            .damage_buffer(0, 0, width as i32, height as i32);
+        buffer.attach_to(&self.content)?;
+        self.content.commit();
+        self.viewport
+            .set_destination(self.width as i32, self.height as i32);
+        if !self.background_attached {
+            let (background, pixel) = self.pool.create_buffer(1, 1, 4, wl_shm::Format::Argb8888)?;
+            pixel.copy_from_slice(&0xaa000000u32.to_ne_bytes());
+            background.attach_to(self.layer.wl_surface())?;
+            self.background_attached = true;
+        }
         self.layer
             .wl_surface()
-            .damage_buffer(0, 0, width as i32, height as i32);
-        buffer.attach_to(self.layer.wl_surface())?;
+            .damage(0, 0, self.width as i32, self.height as i32);
         self.layer.commit();
+        crate::startup::mark("content and background committed");
         Ok(())
     }
 }
@@ -459,9 +520,12 @@ impl CompositorHandler for Launcher {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         factor: i32,
     ) {
+        if surface != self.layer.wl_surface() {
+            return;
+        }
         self.scale = factor.max(1);
         self.draw();
     }
@@ -622,6 +686,9 @@ impl ProvidesRegistryState for Launcher {
     }
     registry_handlers![OutputState, SeatState];
 }
+delegate_subcompositor!(Launcher);
+wayland_client::delegate_noop!(Launcher: ignore WpViewporter);
+wayland_client::delegate_noop!(Launcher: ignore WpViewport);
 delegate_compositor!(Launcher);
 delegate_output!(Launcher);
 delegate_shm!(Launcher);
@@ -632,7 +699,44 @@ delegate_registry!(Launcher);
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy, paint_caret, subsequence};
+    use super::{content_layout, fuzzy, paint_caret, paint_text, subsequence};
+    #[test]
+    fn content_bounds_preserve_origin_and_clip_long_text() {
+        let (x, y, w, h) = content_layout(1646, 1029, 200.0, 5);
+        assert_eq!((x + 2, y + 2), (576, 360));
+        assert_eq!((w, h), (228, 273));
+        assert!(w * h * 4 < 1646 * 1029);
+        for (width, height) in [(1, 1), (3, 2), (100, 40), (1646, 1029)] {
+            let (x, y, w, h) = content_layout(width, height, f32::MAX, 5);
+            assert!(w > 0 && h > 0);
+            assert!(x as u32 + w <= width && y as u32 + h <= height);
+        }
+    }
+    #[test]
+    fn transparent_text_is_premultiplied_and_retains_theme() {
+        let font = crate::font::load().unwrap();
+        for (color, matches, ink) in [
+            (0xffffff, vec![], 0xffffff),
+            (0xff6347, vec![], 0xff6347),
+            (0xffffff, vec![0], 0xff4500),
+        ] {
+            let mut pixels = vec![0; 64 * 40 * 4];
+            paint_text(&mut pixels, 64, 40, &font, 24.0, 2, 2, "M", color, &matches);
+            assert!(pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| u32::from_ne_bytes(*p) == 0xff000000 | ink));
+            for p in pixels.as_chunks::<4>().0 {
+                let value = u32::from_ne_bytes(*p);
+                let a = value >> 24;
+                for shift in [0, 8, 16] {
+                    assert!((value >> shift) & 255 <= a);
+                }
+            }
+            assert_eq!(&pixels[..4], &[0; 4]);
+        }
+    }
     #[test]
     fn transposed_typo_matches_app_and_word() {
         assert_eq!(fuzzy("Chrome", "chrmoe").unwrap().0, vec![0, 1, 2, 3, 4, 5]);

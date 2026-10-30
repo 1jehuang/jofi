@@ -5,5 +5,7 @@ edition = "2021"
 
 [dependencies]
 ab_glyph = "0.2"
+fontconfig = "0.7"
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
