@@ -1,14 +1,9 @@
-use crate::desktop::DesktopEntry;
-use crate::history::History;
-use crate::launcher::{build_launch_command, launch};
-use crate::search::{SearchIndex, SearchResult};
-use crate::telemetry::Telemetry;
-use anyhow::{Context, Result, bail};
-use fontdue::layout::{CoordinateSystem, Layout, LayoutSettings, TextStyle};
-use fontdue::{Font, FontSettings};
-use serde::Serialize;
-use serde_json::{Map, json};
-use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+//! Native, event-driven layer-shell launcher. All rendering is premultiplied ARGB software text.
+use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
+use smithay_client_toolkit::reexports::{
+    calloop::{EventLoop, LoopHandle},
+    calloop_wayland_source::WaylandSource,
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
@@ -17,835 +12,531 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
         Capability, SeatHandler, SeatState,
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
     },
     shell::{
-        WaylandSurface,
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
         },
+        WaylandSurface,
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::fs;
-use std::num::NonZeroU32;
-use std::path::PathBuf;
-use std::time::Instant;
+use std::{error::Error, process::Command};
 use wayland_client::{
-    Connection, QueueHandle,
+    globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
+    Connection, QueueHandle,
 };
 
-const NAMESPACE: &str = "jofi";
-const DEFAULT_MAX_RESULTS: usize = 5;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct UiOptions {
-    pub font_path: Option<PathBuf>,
-    pub background_alpha: u8,
-    pub query_size_px: f32,
-    pub result_size_px: f32,
-    pub result_gap_px: f32,
-    pub x_percent: f32,
-    pub y_percent: f32,
-    pub render_scale: u32,
-    pub max_results: usize,
-}
-
-impl Default for UiOptions {
-    fn default() -> Self {
-        Self {
-            font_path: None,
-            // Matches tofi's #000A fullscreen background by default.
-            background_alpha: 0xAA,
-            query_size_px: 34.0,
-            result_size_px: 28.0,
-            result_gap_px: 25.0,
-            x_percent: 0.35,
-            y_percent: 0.35,
-            render_scale: 3,
-            max_results: DEFAULT_MAX_RESULTS,
-        }
+/// Show the launcher, returning the original input index, or None on cancellation.
+pub fn choose(names: &[String]) -> Result<Option<usize>, Box<dyn Error>> {
+    let font_path = Command::new("fc-match")
+        .args(["-f", "%{file}", "monospace"])
+        .output()?;
+    if !font_path.status.success() {
+        return Err("fc-match could not find a monospace font".into());
     }
-}
-
-pub fn run_launcher(
-    index: SearchIndex,
-    telemetry: Telemetry,
-    options: UiOptions,
-    history: History,
-) -> Result<()> {
-    let startup = Instant::now();
-    let font_path = resolve_font_path(options.font_path.clone())?;
-    let font_bytes = fs::read(&font_path)
-        .with_context(|| format!("failed to read font {}", font_path.display()))?;
-    let font = Font::from_bytes(font_bytes, FontSettings::default())
-        .map_err(|err| anyhow::anyhow!("failed to parse font {}: {err}", font_path.display()))?;
-
-    let conn = Connection::connect_to_env().context("failed to connect to Wayland compositor")?;
-    let (globals, mut event_queue) = registry_queue_init(&conn)?;
-    let qh = event_queue.handle();
-
-    let compositor =
-        CompositorState::bind(&globals, &qh).context("wl_compositor is unavailable")?;
-    let layer_shell = LayerShell::bind(&globals, &qh).context("wlr layer-shell is unavailable")?;
-    let shm = Shm::bind(&globals, &qh).context("wl_shm is unavailable")?;
-
-    let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some(NAMESPACE), None);
+    let path = String::from_utf8(font_path.stdout)?;
+    let font = FontArc::try_from_vec(std::fs::read(path.trim())?)?;
+    let conn = Connection::connect_to_env()?;
+    let (globals, queue) = registry_queue_init(&conn)?;
+    let mut event_loop: EventLoop<Launcher> = EventLoop::try_new()?;
+    let qh = queue.handle();
+    WaylandSource::new(conn.clone(), queue).insert(event_loop.handle())?;
+    let compositor = CompositorState::bind(&globals, &qh)?;
+    let shell = LayerShell::bind(&globals, &qh)?;
+    let shm = Shm::bind(&globals, &qh)?;
+    let layer = shell.create_layer_surface(
+        &qh,
+        compositor.create_surface(&qh),
+        Layer::Overlay,
+        Some("launcher"),
+        None,
+    );
     layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-    layer.set_exclusive_zone(-1);
     layer.set_size(0, 0);
+    layer.set_exclusive_zone(-1);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     layer.commit();
-
-    let pool = SlotPool::new(4, &shm).context("failed to create Wayland shm pool")?;
-
-    let mut app = LauncherApp {
-        registry_state: RegistryState::new(&globals),
-        seat_state: SeatState::new(&globals, &qh),
-        output_state: OutputState::new(&globals, &qh),
+    let pool = SlotPool::new(4096, &shm)?;
+    let mut app = Launcher {
+        loop_handle: event_loop.handle(),
+        registry: RegistryState::new(&globals),
+        seats: SeatState::new(&globals, &qh),
+        outputs: OutputState::new(&globals, &qh),
         shm,
         pool,
         layer,
-        keyboard: None,
-        keyboard_focus: false,
-        width: 1,
-        height: 1,
-        first_configure: true,
-        exit: false,
-        index,
-        query: String::new(),
-        results: Vec::new(),
-        selected: 0,
         font,
-        font_path,
-        options,
-        history,
-        telemetry,
-        started_at: startup,
-        last_draw_ns: 0,
+        names: names.to_vec(),
+        query: String::new(),
+        matches: Vec::new(),
+        selected: 0,
+        width: 0,
+        height: 0,
+        scale: 1,
+        keyboard: None,
+        modifiers: Modifiers::default(),
+        done: false,
+        answer: None,
+        failure: None,
     };
-    app.refresh_results();
-
-    app.telemetry.event("ui.start", {
-        let mut fields = Map::new();
-        fields.insert("namespace".to_string(), json!(NAMESPACE));
-        fields.insert("font_path".to_string(), json!(app.font_path));
-        fields.insert("entries".to_string(), json!(app.index.len()));
-        fields
-    });
-
-    while !app.exit {
-        event_queue.blocking_dispatch(&mut app)?;
+    app.filter();
+    while !app.done {
+        event_loop.dispatch(None, &mut app)?;
     }
-
-    app.telemetry.event("ui.exit", {
-        let mut fields = Map::new();
-        fields.insert(
-            "uptime_ns".to_string(),
-            json!(app.started_at.elapsed().as_nanos() as u64),
-        );
-        fields.insert("last_draw_ns".to_string(), json!(app.last_draw_ns));
-        fields
-    });
-
-    Ok(())
+    if let Some(error) = app.failure {
+        return Err(error.into());
+    }
+    Ok(app.answer)
 }
 
-struct LauncherApp {
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
+struct Launcher {
+    loop_handle: LoopHandle<'static, Launcher>,
+    registry: RegistryState,
+    seats: SeatState,
+    outputs: OutputState,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    keyboard_focus: bool,
+    font: FontArc,
+    names: Vec<String>,
+    query: String,
+    matches: Vec<(usize, Vec<usize>, i64)>,
+    selected: usize,
     width: u32,
     height: u32,
-    first_configure: bool,
-    exit: bool,
-    index: SearchIndex,
-    query: String,
-    results: Vec<SearchResult>,
-    selected: usize,
-    font: Font,
-    font_path: PathBuf,
-    options: UiOptions,
-    history: History,
-    telemetry: Telemetry,
-    started_at: Instant,
-    last_draw_ns: u64,
+    scale: i32,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    modifiers: Modifiers,
+    done: bool,
+    answer: Option<usize>,
+    failure: Option<String>,
 }
 
-impl LauncherApp {
-    fn refresh_results(&mut self) {
-        let mut span = self.telemetry.span("ui.search").field("query", &self.query);
-        self.results = self
-            .index
-            .search(&self.query, self.options.max_results.max(1));
-        if self.selected >= self.results.len() {
-            self.selected = self.results.len().saturating_sub(1);
+/// Case-insensitive Unicode subsequence match. Positions are character indices, never byte offsets.
+fn fuzzy(name: &str, query: &str) -> Option<(Vec<usize>, i64)> {
+    let hay: Vec<char> = name.chars().collect();
+    let needle: Vec<char> = query.chars().collect();
+    let mut positions = Vec::new();
+    let mut next = 0;
+    let mut score = 0;
+    for wanted in needle {
+        let found = (next..hay.len()).find(|&i| hay[i].to_lowercase().eq(wanted.to_lowercase()))?;
+        score += (found - next) as i64 * 4;
+        if positions.is_empty() {
+            score += found as i64 * 3;
         }
-        span.set_field("results", self.results.len());
+        if found == 0 || !hay[found - 1].is_alphanumeric() {
+            score -= 5;
+        }
+        positions.push(found);
+        next = found + 1;
     }
+    Some((positions, score))
+}
 
-    fn selected_entry(&self) -> Option<&DesktopEntry> {
-        self.results.get(self.selected).map(|result| &result.entry)
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        if self.results.is_empty() {
-            self.selected = 0;
+impl Launcher {
+    fn handle_key(&mut self, event: KeyEvent) {
+        if self.done {
             return;
         }
-        let len = self.results.len() as isize;
-        self.selected = (self.selected as isize + delta).rem_euclid(len) as usize;
-    }
-
-    fn launch_selected(&mut self) {
-        let Some(entry) = self.selected_entry().cloned() else {
-            self.exit = true;
-            return;
-        };
-        let command = build_launch_command(&entry)
-            .map(|cmd| cmd.as_vec())
-            .unwrap_or_default();
-        self.telemetry.event("ui.launch_selected", {
-            let mut fields = Map::new();
-            fields.insert("entry".to_string(), json!(entry.name));
-            fields.insert("query".to_string(), json!(self.query));
-            fields.insert("command".to_string(), json!(command));
-            fields
-        });
-        self.history.increment(&entry.name);
-        if let Err(err) = self.history.save() {
-            self.telemetry.event("history.save_error", {
-                let mut fields = Map::new();
-                fields.insert("entry".to_string(), json!(entry.name));
-                fields.insert("error".to_string(), json!(err.to_string()));
-                fields
-            });
-        }
-        if let Err(err) = launch(&entry) {
-            self.telemetry.event("ui.launch_error", {
-                let mut fields = Map::new();
-                fields.insert("entry".to_string(), json!(entry.name));
-                fields.insert("error".to_string(), json!(err.to_string()));
-                fields
-            });
-        }
-        self.exit = true;
-    }
-
-    fn handle_key(&mut self, qh: &QueueHandle<Self>, event: KeyEvent) {
-        let ctrl = self.current_ctrl();
         match event.keysym {
-            Keysym::Escape => self.exit = true,
-            Keysym::Return => self.launch_selected(),
+            Keysym::Escape => self.done = true,
+            Keysym::Return | Keysym::KP_Enter => {
+                self.answer = self.matches.get(self.selected).map(|m| m.0);
+                if self.answer.is_some() {
+                    self.done = true;
+                }
+            }
             Keysym::BackSpace => {
                 self.query.pop();
-                self.selected = 0;
-                self.refresh_results();
-                self.draw(qh);
+                self.filter();
             }
-            Keysym::Up => {
-                self.move_selection(-1);
-                self.draw(qh);
-            }
-            Keysym::Down => {
-                self.move_selection(1);
-                self.draw(qh);
-            }
-            Keysym::h if ctrl => {
-                self.query.pop();
-                self.selected = 0;
-                self.refresh_results();
-                self.draw(qh);
-            }
-            Keysym::u if ctrl => {
+            Keysym::u | Keysym::U if self.modifiers.ctrl => {
                 self.query.clear();
-                self.selected = 0;
-                self.refresh_results();
-                self.draw(qh);
+                self.filter();
             }
-            Keysym::c if ctrl => self.exit = true,
-            Keysym::j if ctrl => {
-                self.move_selection(1);
-                self.draw(qh);
+            Keysym::Up | Keysym::ISO_Left_Tab => {
+                if !self.matches.is_empty() {
+                    self.selected = (self.selected + self.matches.len() - 1) % self.matches.len();
+                }
             }
-            Keysym::k if ctrl => {
-                self.move_selection(-1);
-                self.draw(qh);
+            Keysym::Down | Keysym::Tab => {
+                if !self.matches.is_empty() {
+                    self.selected = (self.selected + 1) % self.matches.len();
+                }
             }
             _ => {
-                if ctrl {
-                    return;
-                }
-                if let Some(text) = event.utf8.as_deref().filter(|text| is_printable_text(text)) {
-                    self.query.push_str(text);
-                    self.selected = 0;
-                    self.refresh_results();
-                    self.draw(qh);
+                if !self.modifiers.ctrl && !self.modifiers.alt && !self.modifiers.logo {
+                    if let Some(text) = event.utf8 {
+                        self.query.extend(text.chars().filter(|c| !c.is_control()));
+                        self.filter();
+                    }
                 }
             }
         }
+        self.draw();
     }
-
-    fn current_ctrl(&self) -> bool {
-        // Updated through KeyboardHandler::update_modifiers. Stored indirectly by xkbcommon in SCTK's
-        // keyboard state, but the handler passes the current value to us; keep a conservative fallback
-        // through keyboard focus only in case modifiers haven't arrived yet.
-        CTRL_ACTIVE.with(|ctrl| ctrl.get()) && self.keyboard_focus
+    fn filter(&mut self) {
+        self.matches = self
+            .names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                fuzzy(name, &self.query).map(|(positions, score)| (index, positions, score))
+            })
+            .collect();
+        self.matches.sort_by_key(|entry| (entry.2, entry.0));
+        self.selected = 0;
     }
-
-    fn draw(&mut self, _qh: &QueueHandle<Self>) {
-        if self.width == 0 || self.height == 0 {
+    fn draw(&mut self) {
+        if self.width == 0 || self.height == 0 || self.done {
             return;
         }
-
-        let start = Instant::now();
-        let width = self.width;
-        let height = self.height;
-        let render_scale = self.options.render_scale.max(1);
-        let buffer_width = width.saturating_mul(render_scale);
-        let buffer_height = height.saturating_mul(render_scale);
-        let stride = buffer_width as i32 * 4;
-        let lines = self.visible_lines();
-        let Ok((buffer, canvas)) = self.pool.create_buffer(
-            buffer_width as i32,
-            buffer_height as i32,
-            stride,
+        if let Err(error) = self.render() {
+            self.failure = Some(error.to_string());
+            self.done = true;
+        }
+    }
+    fn render(&mut self) -> Result<(), Box<dyn Error>> {
+        let scale = self.scale.max(1) as u32;
+        let width = self
+            .width
+            .checked_mul(scale)
+            .ok_or("surface width overflow")?;
+        let height = self
+            .height
+            .checked_mul(scale)
+            .ok_or("surface height overflow")?;
+        let stride = width
+            .checked_mul(4)
+            .filter(|&n| n <= i32::MAX as u32)
+            .ok_or("surface stride overflow")?;
+        if width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err("surface too large".into());
+        }
+        let (buffer, canvas) = self.pool.create_buffer(
+            width as i32,
+            height as i32,
+            stride as i32,
             wl_shm::Format::Argb8888,
-        ) else {
-            self.exit = true;
-            return;
-        };
-
-        fill_background(canvas, self.options.background_alpha);
-        draw_lines(
+        )?;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&0xaa000000u32.to_ne_bytes());
+        }
+        let font_size = 24.0 * scale as f32;
+        let x = (width as f32 * 0.35) as i32;
+        let y = (height as f32 * 0.35) as i32;
+        let line = (font_size + 25.0 * scale as f32) as i32;
+        let input = format!("> {}_", self.query);
+        paint_text(
             canvas,
-            buffer_width,
-            buffer_height,
+            width,
+            height,
             &self.font,
-            &lines,
-            LayoutSpec {
-                x: (width as f32 * self.options.x_percent).round() * render_scale as f32,
-                y: (height as f32 * self.options.y_percent).round() * render_scale as f32,
-                scale: render_scale as f32,
-            },
+            font_size,
+            x,
+            y,
+            &input,
+            0xffffff,
+            &[],
         );
-
+        if self.matches.is_empty() {
+            paint_text(
+                canvas,
+                width,
+                height,
+                &self.font,
+                font_size,
+                x,
+                y + line,
+                "No matches",
+                0xffffff,
+                &[],
+            );
+        } else {
+            let start = self.selected.saturating_sub(4);
+            for (row, (index, positions, _)) in self.matches.iter().skip(start).take(5).enumerate()
+            {
+                let color = if start + row == self.selected {
+                    0xff6347
+                } else {
+                    0xffffff
+                };
+                paint_text(
+                    canvas,
+                    width,
+                    height,
+                    &self.font,
+                    font_size,
+                    x,
+                    y + line * (row as i32 + 1),
+                    &self.names[*index],
+                    color,
+                    positions,
+                );
+            }
+        }
+        self.layer.wl_surface().set_buffer_scale(self.scale.max(1));
         self.layer
             .wl_surface()
-            .damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
-        if buffer.attach_to(self.layer.wl_surface()).is_ok() {
-            let _ = self.layer.set_buffer_scale(render_scale);
-            self.layer.commit();
-        }
-        self.last_draw_ns = start.elapsed().as_nanos() as u64;
-        self.telemetry.event("ui.draw", {
-            let mut fields = Map::new();
-            fields.insert("width".to_string(), json!(width));
-            fields.insert("height".to_string(), json!(height));
-            fields.insert("buffer_width".to_string(), json!(buffer_width));
-            fields.insert("buffer_height".to_string(), json!(buffer_height));
-            fields.insert("render_scale".to_string(), json!(render_scale));
-            fields.insert("duration_ns".to_string(), json!(self.last_draw_ns));
-            fields.insert("query_len".to_string(), json!(self.query.chars().count()));
-            fields.insert("results".to_string(), json!(self.results.len()));
-            fields
-        });
-    }
-
-    fn visible_lines(&self) -> Vec<LineSpec> {
-        let mut lines =
-            Vec::with_capacity(self.results.len() + usize::from(!self.query.is_empty()));
-        if !self.query.is_empty() {
-            lines.push(LineSpec {
-                text: self.query.clone(),
-                size_px: self.options.query_size_px,
-                color: Color::rgb(245, 247, 255),
-                gap_after_px: self.options.result_size_px * 0.9,
-            });
-        }
-        for (idx, result) in self.results.iter().enumerate() {
-            lines.push(LineSpec {
-                text: result.entry.name.clone(),
-                size_px: self.options.result_size_px,
-                color: if idx == self.selected {
-                    Color::rgb(0, 255, 255)
-                } else {
-                    Color::rgb(255, 255, 255)
-                },
-                gap_after_px: self.options.result_gap_px,
-            });
-        }
-        lines
+            .damage_buffer(0, 0, width as i32, height as i32);
+        buffer.attach_to(self.layer.wl_surface())?;
+        self.layer.commit();
+        Ok(())
     }
 }
 
-thread_local! {
-    static CTRL_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+#[allow(clippy::too_many_arguments)]
+fn paint_text(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    font: &FontArc,
+    size: f32,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: u32,
+    matches: &[usize],
+) {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut cursor = x as f32;
+    let baseline = y as f32 + scaled.ascent();
+    for (index, character) in text.chars().enumerate() {
+        let id = scaled.glyph_id(character);
+        let glyph = id.with_scale_and_position(size, point(cursor, baseline));
+        let ink = if matches.contains(&index) {
+            0xff4500
+        } else {
+            color
+        };
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, coverage| {
+                let px = bounds.min.x as i32 + gx as i32;
+                let py = bounds.min.y as i32 + gy as i32;
+                if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                    return;
+                }
+                let offset = (py as usize * width as usize + px as usize) * 4;
+                let dest = u32::from_ne_bytes(canvas[offset..offset + 4].try_into().unwrap());
+                let a = (coverage * 255.0).round() as u32;
+                let inverse = 255 - a;
+                let mut result = (a + ((dest >> 24) * inverse + 127) / 255) << 24;
+                for shift in [0, 8, 16] {
+                    let channel =
+                        (((ink >> shift) & 255) * a + ((dest >> shift) & 255) * inverse + 127)
+                            / 255;
+                    result |= channel << shift;
+                }
+                canvas[offset..offset + 4].copy_from_slice(&result.to_ne_bytes());
+            });
+        }
+        cursor += scaled.h_advance(id);
+        if cursor >= width as f32 {
+            break;
+        }
+    }
 }
 
-impl CompositorHandler for LauncherApp {
+impl CompositorHandler for Launcher {
     fn scale_factor_changed(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        factor: i32,
     ) {
+        self.scale = factor.max(1);
+        self.draw();
     }
     fn transform_changed(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_transform: wl_output::Transform,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
     ) {
     }
-    fn frame(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _time: u32,
-    ) {
-    }
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
     fn surface_enter(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
     ) {
     }
     fn surface_leave(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
     ) {
     }
 }
-
-impl OutputHandler for LauncherApp {
+impl OutputHandler for Launcher {
     fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
+        &mut self.outputs
     }
-    fn new_output(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
-    fn update_output(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
-    fn output_destroyed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
-
-impl LayerShellHandler for LauncherApp {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.exit = true;
+impl LayerShellHandler for Launcher {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
+        self.done = true;
     }
-
     fn configure(
         &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-        configure: LayerSurfaceConfigure,
-        _serial: u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &LayerSurface,
+        config: LayerSurfaceConfigure,
+        _: u32,
     ) {
-        self.width = NonZeroU32::new(configure.new_size.0).map_or(1920, NonZeroU32::get);
-        self.height = NonZeroU32::new(configure.new_size.1).map_or(1080, NonZeroU32::get);
-        if self.first_configure {
-            self.first_configure = false;
-            self.telemetry.event("ui.first_configure", {
-                let mut fields = Map::new();
-                fields.insert("width".to_string(), json!(self.width));
-                fields.insert("height".to_string(), json!(self.height));
-                fields.insert(
-                    "startup_to_configure_ns".to_string(),
-                    json!(self.started_at.elapsed().as_nanos() as u64),
-                );
-                fields
-            });
-        }
-        self.draw(qh);
+        self.width = config.new_size.0.max(1);
+        self.height = config.new_size.1.max(1);
+        self.draw();
     }
 }
-
-impl SeatHandler for LauncherApp {
+impl SeatHandler for Launcher {
     fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
+        &mut self.seats
     }
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
-
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
     fn new_capability(
         &mut self,
-        _conn: &Connection,
+        _: &Connection,
         qh: &QueueHandle<Self>,
         seat: wl_seat::WlSeat,
-        capability: Capability,
+        cap: Capability,
     ) {
-        if capability == Capability::Keyboard && self.keyboard.is_none() {
-            match self.seat_state.get_keyboard(qh, &seat, None) {
+        if cap == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seats.get_keyboard_with_repeat(
+                qh,
+                &seat,
+                None,
+                self.loop_handle.clone(),
+                Box::new(|app, _, event| app.handle_key(event)),
+            ) {
                 Ok(keyboard) => self.keyboard = Some(keyboard),
-                Err(err) => {
-                    self.telemetry.event("ui.keyboard_error", {
-                        let mut fields = Map::new();
-                        fields.insert("error".to_string(), json!(err.to_string()));
-                        fields
-                    });
-                    self.exit = true;
+                Err(error) => {
+                    self.failure = Some(error.to_string());
+                    self.done = true;
                 }
             }
         }
     }
-
     fn remove_capability(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
-        capability: Capability,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        cap: Capability,
     ) {
-        if capability == Capability::Keyboard && self.keyboard.is_some() {
-            self.keyboard.take().unwrap().release();
+        if cap == Capability::Keyboard {
+            if let Some(keyboard) = self.keyboard.take() {
+                keyboard.release();
+            }
         }
     }
-
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
-    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
-
-impl KeyboardHandler for LauncherApp {
+impl KeyboardHandler for Launcher {
     fn enter(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        surface: &wl_surface::WlSurface,
-        _serial: u32,
-        _raw: &[u32],
-        _keysyms: &[Keysym],
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
     ) {
-        if self.layer.wl_surface() == surface {
-            self.keyboard_focus = true;
-        }
     }
-
     fn leave(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        surface: &wl_surface::WlSurface,
-        _serial: u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
     ) {
-        if self.layer.wl_surface() == surface {
-            self.keyboard_focus = false;
-            CTRL_ACTIVE.with(|ctrl| ctrl.set(false));
-        }
     }
-
     fn press_key(
         &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
         event: KeyEvent,
     ) {
-        self.handle_key(qh, event);
+        self.handle_key(event);
     }
-
-    fn repeat_key(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        event: KeyEvent,
-    ) {
-        self.handle_key(qh, event);
-    }
-
     fn release_key(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        _event: KeyEvent,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
     ) {
     }
-
     fn update_modifiers(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
         modifiers: Modifiers,
-        _raw_modifiers: RawModifiers,
-        _layout: u32,
+        _: u32,
     ) {
-        CTRL_ACTIVE.with(|ctrl| ctrl.set(modifiers.ctrl));
+        self.modifiers = modifiers;
     }
 }
-
-impl ShmHandler for LauncherApp {
+impl ShmHandler for Launcher {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
     }
 }
-
-impl ProvidesRegistryState for LauncherApp {
+impl ProvidesRegistryState for Launcher {
     fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
+        &mut self.registry
     }
     registry_handlers![OutputState, SeatState];
 }
-
-delegate_compositor!(LauncherApp);
-delegate_output!(LauncherApp);
-delegate_shm!(LauncherApp);
-delegate_seat!(LauncherApp);
-delegate_keyboard!(LauncherApp);
-delegate_layer!(LauncherApp);
-delegate_registry!(LauncherApp);
-
-#[derive(Debug, Clone)]
-struct LineSpec {
-    text: String,
-    size_px: f32,
-    color: Color,
-    gap_after_px: f32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Color {
-    r: u8,
-    g: u8,
-    b: u8,
-}
-
-impl Color {
-    const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LayoutSpec {
-    x: f32,
-    y: f32,
-    scale: f32,
-}
-
-fn draw_lines(
-    canvas: &mut [u8],
-    width: u32,
-    _height: u32,
-    font: &Font,
-    lines: &[LineSpec],
-    spec: LayoutSpec,
-) {
-    if lines.is_empty() {
-        return;
-    }
-
-    let x = spec.x.round();
-    let mut y = spec.y.round();
-    let fonts = [font.clone()];
-
-    for line in lines {
-        y = y.round();
-        draw_text(
-            canvas,
-            width,
-            font,
-            TextDraw {
-                fonts: &fonts,
-                text: &line.text,
-                size_px: line.size_px * spec.scale,
-                x,
-                y,
-                color: line.color,
-            },
-        );
-        y += (line.size_px + line.gap_after_px) * spec.scale;
-    }
-}
-
-struct TextDraw<'a> {
-    fonts: &'a [Font; 1],
-    text: &'a str,
-    size_px: f32,
-    x: f32,
-    y: f32,
-    color: Color,
-}
-
-fn draw_text(canvas: &mut [u8], width: u32, font: &Font, spec: TextDraw<'_>) {
-    let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
-    layout.reset(&LayoutSettings {
-        x: spec.x,
-        y: spec.y,
-        ..LayoutSettings::default()
-    });
-    layout.append(spec.fonts, &TextStyle::new(spec.text, spec.size_px, 0));
-
-    let glyphs = layout.glyphs();
-    if glyphs.is_empty() {
-        return;
-    }
-    for glyph in glyphs {
-        let (metrics, bitmap) = font.rasterize_config(glyph.key);
-        let gx = glyph.x.round() as i32;
-        let gy = glyph.y.round() as i32;
-        draw_glyph(
-            canvas,
-            width,
-            GlyphDraw {
-                x: gx,
-                y: gy,
-                width: metrics.width,
-                height: metrics.height,
-                bitmap: &bitmap,
-                color: spec.color,
-            },
-        );
-    }
-}
-
-struct GlyphDraw<'a> {
-    x: i32,
-    y: i32,
-    width: usize,
-    height: usize,
-    bitmap: &'a [u8],
-    color: Color,
-}
-
-fn draw_glyph(canvas: &mut [u8], width: u32, glyph: GlyphDraw<'_>) {
-    let height = canvas.len() / (width as usize * 4);
-    for row in 0..glyph.height {
-        let py = glyph.y + row as i32;
-        if py < 0 || py >= height as i32 {
-            continue;
-        }
-        for col in 0..glyph.width {
-            let px = glyph.x + col as i32;
-            if px < 0 || px >= width as i32 {
-                continue;
-            }
-            let coverage = glyph.bitmap[row * glyph.width + col];
-            if coverage == 0 {
-                continue;
-            }
-            let idx = ((py as usize * width as usize) + px as usize) * 4;
-            blend_pixel(&mut canvas[idx..idx + 4], glyph.color, coverage);
-        }
-    }
-}
-
-fn blend_pixel(dst: &mut [u8], color: Color, alpha: u8) {
-    let sa = alpha as u32;
-    let inv = 255 - sa;
-    let sr = color.r as u32 * sa / 255;
-    let sg = color.g as u32 * sa / 255;
-    let sb = color.b as u32 * sa / 255;
-
-    let db = dst[0] as u32;
-    let dg = dst[1] as u32;
-    let dr = dst[2] as u32;
-    let da = dst[3] as u32;
-
-    let out_b = sb + db * inv / 255;
-    let out_g = sg + dg * inv / 255;
-    let out_r = sr + dr * inv / 255;
-    let out_a = sa + da * inv / 255;
-
-    dst[0] = out_b.min(255) as u8;
-    dst[1] = out_g.min(255) as u8;
-    dst[2] = out_r.min(255) as u8;
-    dst[3] = out_a.min(255) as u8;
-}
-
-fn fill_background(canvas: &mut [u8], alpha: u8) {
-    for px in canvas.chunks_exact_mut(4) {
-        px[0] = 0;
-        px[1] = 0;
-        px[2] = 0;
-        px[3] = alpha;
-    }
-}
-
-fn is_printable_text(text: &str) -> bool {
-    text.chars().all(|ch| !ch.is_control())
-}
-
-fn resolve_font_path(configured: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(path) = configured.or_else(|| std::env::var_os("JOFI_FONT").map(PathBuf::from)) {
-        if path.is_file() {
-            return Ok(path);
-        }
-        bail!("configured font path does not exist: {}", path.display());
-    }
-
-    let candidates = [
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFont-Regular.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Light.ttf",
-        "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    ];
-    candidates
-        .iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .ok_or_else(|| anyhow::anyhow!("no usable font found; pass --font or set JOFI_FONT"))
-}
+delegate_compositor!(Launcher);
+delegate_output!(Launcher);
+delegate_shm!(Launcher);
+delegate_seat!(Launcher);
+delegate_keyboard!(Launcher);
+delegate_layer!(Launcher);
+delegate_registry!(Launcher);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    use super::fuzzy;
     #[test]
-    fn printable_text_rejects_controls() {
-        assert!(is_printable_text("abc"));
-        assert!(!is_printable_text("\u{1b}"));
+    fn unicode_positions_are_characters() {
+        assert_eq!(fuzzy("Éclair 🦀 Rust", "é🦀r").unwrap().0, vec![0, 7, 9]);
     }
-
     #[test]
-    fn background_is_premultiplied_transparent_black() {
-        let mut canvas = vec![255; 8];
-        fill_background(&mut canvas, 123);
-        assert_eq!(canvas, vec![0, 0, 0, 123, 0, 0, 0, 123]);
+    fn subsequences_and_empty() {
+        assert!(fuzzy("Firefox", "ffx").is_some());
+        assert!(fuzzy("Firefox", "z").is_none());
+        assert_eq!(fuzzy("anything", "").unwrap().0, Vec::<usize>::new());
+    }
+    #[test]
+    fn contiguous_match_ranks_first() {
+        assert!(
+            fuzzy("terminal", "term").unwrap().1 < fuzzy("the error manager", "term").unwrap().1
+        );
     }
 }
