@@ -1,6 +1,7 @@
 mod catalog;
 mod font;
 mod scripts;
+mod search;
 mod startup;
 mod ui;
 
