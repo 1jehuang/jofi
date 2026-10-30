@@ -149,3 +149,65 @@ ambiguous/malformed records, missing executable and compilation failures,
 12 concurrent desktop launches, and 160 threaded locked updates with private
 permissions. No actual user history, imported data, or compositor configuration
 is checked into this repository.
+
+## Reported typo examples and editing shortcuts follow-up
+
+The later October 30 follow-up (`603535c`, `f8beb1a`, `d13aa3b`) addresses the
+actual reported queries `vekstpo` → Vesktop and `fireofv x` → Firefox. Two OSA
+edits are now allowed from **seven** normalized alphanumeric characters, rather
+than eight. Four-to-six-character terms still allow only one edit and shorter
+terms remain strict. Independent AND terms may match overlapping text in an
+entry. Exact/prefix, dense fuzzy, boundary-acronym, typo, and weak-scatter
+ranking policy remains intact. The quality corpus now contains 18 tests,
+including screenshot-example first-place/highlight checks and threshold/noise
+regressions. The independent 48,387-comparison oracle remains unchanged.
+
+Alt/Ctrl+A/C/X/V, selected-text replacement/deletion, Unicode-grapheme Backspace,
+and Alt/Ctrl+Backspace word deletion are tested with actual keys. Clipboard
+operations use bounded worker-thread helpers. A deliberately failing helper
+also verifies that a cut cannot erase the query or launch stale results while
+pending. All **26 workflow cases** passed both directly and with the desktop's
+existing Alt-to-Ctrl `wtype` bindings, and passed again against the installed
+hosted release with those bindings. Clipboard tests address only the private
+nested compositor, never the user's real clipboard.
+
+Final validation receipts:
+
+- Hosted check: `20261030-031615583-1259122`, passed.
+- Hosted full tests: `20261030-031616242-1259247`, **52 passed, 1 ignored**.
+- Hosted strict all-target Clippy: `20261030-031618073-1259399`, passed.
+- Explicit hosted release: `20261030-031820431-1279669`, passed. The earlier
+  automatic release route chose a busy local machine, so it was replaced by
+  this explicitly hosted artifact before installation.
+- Installed SHA256:
+  `3d052b9742b96f95993cea18c65d0d45a08649fcdc2b3d08aa01aa403badef19`.
+
+Reproduce the desktop-remapping workflow with:
+
+```sh
+python3 bench/search-workflow.py --remap-alt --jofi ~/.local/bin/jofi
+```
+
+Fresh filtering measurements used the same original baseline and actual
+130-name TSV as above, with the two reported queries added to the individual-key
+101-sample suite. Controlled local benchmark build receipt:
+`20261030-031330310-1235376`. The executable was copied immutably before running,
+with SHA256 `ce1767b408c7f584eea92d0775dd8acbf9c8a64e3a6491db9190bbcc1310984d`.
+Matcher source SHA256:
+`7fae0d65006a65a57b98f3df53723a4e4b4e830f583901d4533e924d10df07af`.
+Harness SHA256:
+`1826a81e6669c945a1d96ea082a71f9f087e3920cc7ec4b510c7b7a1b009afc1`.
+The same local-only benchmark requirement and busy-laptop caveats above apply.
+
+| Query | Actual 130 indexed p95 (µs) | Original baseline p95 (µs) | Synthetic 10k indexed p95 (ms) |
+| --- | ---: | ---: | ---: |
+| term | 12.4 | 46.5 | 1.859 |
+| chrmoe | 9.5 | 68.5 | 1.104 |
+| zzzzzz | 8.6 | 64.4 | 0.909 |
+| vekstpo | 16.0 | 65.0 | 1.694 |
+| fireofv x | 17.3 | 78.5 | 1.796 |
+
+These are filter timings, not clipboard or GUI latency. The original baseline
+does not recover the reported two-error examples, so output sets differ.
+The earlier tables remain historical measurements of the earlier policy, not
+claims about the current executable or controlled before/after attribution.
