@@ -22,8 +22,8 @@ niri blur rule matching `^(tofi|launcher)$` also applies to Jofi.
 
 ## Build and install
 
-Requires Rust, Wayland, fontconfig (`fc-match`), a monospace font, and development
-libraries for Wayland and xkbcommon. `gio` is required to launch desktop entries.
+Requires Rust, Wayland, Fontconfig, a monospace font, and development libraries
+for Wayland and xkbcommon. Normal launching does not spawn `fc-match`. `gio` is required to launch desktop entries.
 On Arch: `pacman -S rust wayland libxkbcommon fontconfig glib2`.
 
 ```sh
@@ -36,7 +36,8 @@ jofi
 ```
 
 Plain Cargo also works outside this development environment. The compositor must
-support `wlr-layer-shell`, as niri does. No X11 fallback is provided.
+support `wlr-layer-shell`, `wl_subcompositor`, and `wp_viewporter`, as niri does.
+No X11 fallback is provided.
 
 Optional niri binding, replacing the existing launcher line when ready:
 
@@ -93,6 +94,42 @@ or Tab to select, Enter to launch, Escape to dismiss, and Ctrl+U to clear the qu
 Recent launches are promoted on the next opening and
 stored in `$XDG_STATE_HOME/jofi/recent`. An advisory runtime lock prevents duplicate
 overlays. There is no telemetry or persistent background process.
+
+## Startup design
+
+The fullscreen dim background is a single stretched pixel. Only the small text
+region is rasterized, with synchronized parent/child commits so the first visible
+frame includes the menu, not just an empty overlay. Catalog scanning, font
+loading, and compositor initialization overlap. Desktop files are still scanned
+live on each opening, with borrowed-field parsing rather than a stale app index.
+
+Fontconfig matching is cached in `$XDG_CACHE_HOME/jofi/font-match`. Cache hits
+validate recursive config, font, and font-cache metadata, symlinks, relevant
+environment variables, and the selected face. Font files are still opened and
+parsed. Fonts/config changes, corruption, or unsupported configuration details
+fall back to fresh native matching. Cache misses do more work than warm opens.
+Fontconfig and its native dependencies load lazily only on a miss. No daemon is
+required, and there is no hardcoded font path.
+
+Set `JOFI_PROFILE_STARTUP=1 jofi` for opt-in stage timings. For repeatable warm
+startup and memory comparisons, use `bench/compare-launchers.py`. This measures
+real text-buffer submission, including the synchronized parent commit, not just
+the one-pixel background. It includes process launch and Wayland debug overhead,
+but is not a measurement of physical screen presentation.
+
+On October 30, 2026, 30 interleaved warm trials per launcher (three warmups)
+on the current niri session measured:
+
+| Launcher | Median content submission | p95 | Median RSS |
+| --- | ---: | ---: | ---: |
+| Optimized Jofi | 4.32 ms | 7.02 ms | 5.46 MiB |
+| Original Jofi | 21.95 ms | 25.48 ms | 31.00 MiB |
+| tofi-drun | 18.31 ms | 22.01 ms | 57.27 MiB |
+
+The warm median meets the 5 ms content-submission target, not a 5 ms worst-case
+or input-readiness guarantee. Median content plus keyboard focus was 7.44 ms.
+A first launch after cache invalidation must perform native font matching and
+write the dependency manifest, so these warm figures do not describe cold opens.
 
 This intentionally starts small: no icon grid, theme language, dependency
 resolver for scripts, stdin menu mode, or tofi compatibility layer. Existing
