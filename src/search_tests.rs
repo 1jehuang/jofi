@@ -168,6 +168,90 @@ fn conservative_typo_edit_budget_and_prefixes() {
     excludes("Chrome", "cxrxme");
     excludes("Chrome", "zzzzzz");
 }
+
+#[test]
+fn screenshot_typos_rank_first_in_realistic_catalog() {
+    let catalog = [
+        "Chromium Browser",
+        "Discord",
+        "Desktop Settings",
+        "VLC media player",
+        "Visual Studio Code",
+        "File Roller",
+        "Firewall Configuration",
+        "FileZilla",
+        "Firefox Profile Manager",
+        "Vesktop",
+        "Firefox",
+        "Xfce Terminal",
+    ];
+    for (query, expected) in [
+        ("vekstpo", 9),
+        ("fireofv", 10),
+        ("fireofv x", 10),
+        ("x fireofv", 10),
+    ] {
+        let result = hits(&catalog, query);
+        assert_eq!(
+            result.first().map(|hit| hit.0),
+            Some(expected),
+            "{query:?}: {result:?}"
+        );
+        assert_eq!(result[0].1, (0..7).collect::<Vec<_>>());
+    }
+    // AND terms are independent: the x is already inside the corrected word.
+    excludes("Firefox", "fireofv z");
+    excludes("Vesktop", "vekstpo x");
+}
+
+#[test]
+fn two_edit_threshold_is_seven_and_remains_bounded() {
+    // Direct typo checks avoid confusing intentional literal subsequences with
+    // typo eligibility. Verify both the edit count and the threshold boundary.
+    for (target, query, expected) in [
+        ("abc", "abx", None),
+        ("abcd", "abcx", Some(1)),
+        ("abcde", "abcxx", None),
+        ("abcdef", "abcxex", None),
+        ("abcdefg", "abcxexg", Some(2)),
+        ("abcdefgh", "abcxexgh", Some(2)),
+        ("abcdefg", "axcxexg", None),
+        ("Vesktop", "vekstpo", Some(2)),
+        ("Firefox", "fireofv", Some(2)),
+        ("Chrome", "cxrxme", None),
+        ("Firefox", "zzzzzzz", None),
+        ("Firefox", "fireo++", None),
+    ] {
+        let entry = super::Prepared::new(target);
+        let query_chars = super::Prepared::query(query).folded;
+        let hit = super::typo_prefix(&entry, &query_chars, &mut super::EditScratch::default());
+        assert_eq!(
+            hit.map(|hit| hit.distance),
+            expected,
+            "{query:?} -> {target:?}"
+        );
+    }
+    for query in ["zzzzzzz", "axcxexg", "fireo++"] {
+        excludes("Firefox Vesktop abcdefg", query);
+    }
+}
+
+#[test]
+fn seven_character_recovery_preserves_dense_and_boundary_quality_tiers() {
+    // Strong dense and boundary subsequences remain above a two-edit hit.
+    for literal in [
+        "vekstpo",
+        "vekstpox",
+        "Very Excellent Kind Spacious Tall Product Organizer",
+        "VeryExcellentKindSpaciousTallProductOrganizer",
+    ] {
+        let result = hits(&["Vesktop", literal], "vekstpo");
+        assert_eq!(result[0].0, 1, "{literal:?}: {result:?}");
+    }
+    // Conversely, an incidental long cross-word scatter stays below recovery.
+    let result = hits(&["Overtake stock photo organizer", "Vesktop"], "vekstpo");
+    assert_eq!(result[0].0, 1, "{result:?}");
+}
 #[test]
 fn short_queries_do_not_trigger_typo_fallback() {
     for q in ["x", "xr", "xro", "chr"] {

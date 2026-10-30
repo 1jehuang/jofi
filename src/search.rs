@@ -168,6 +168,9 @@ impl SearchIndex {
     /// Unicode characters, not bytes or the normalized/segmented search text.
     /// Whitespace-separated terms are ANDed in any order. Other punctuation is
     /// literal, not an undocumented fzf operator language.
+    /// Terms match independently, so their highlighted positions may overlap.
+    /// Alphanumeric word-prefix typos allow one edit at 4..=6 characters and
+    /// two at 7 or more. Shorter terms use literal fuzzy matching only.
     pub fn filter(&mut self, query: &str) -> Vec<SearchMatch> {
         let terms: Vec<_> = query.split_whitespace().map(Prepared::query).collect();
         if terms.is_empty() {
@@ -285,11 +288,13 @@ struct TypoHit {
     completion: usize,
 }
 fn typo_prefix(entry: &Prepared, query: &[char], scratch: &mut EditScratch) -> Option<TypoHit> {
-    // One-letter abbreviation queries must stay precise. Long terms tolerate
-    // two independent mistakes, but there is never unbounded fuzzy edit search.
+    // Keep short abbreviation queries precise. Seven characters provide enough
+    // evidence for two mistakes (vekstpo -> Vesktop, fireofv -> Firefox), while
+    // six-character terms retain the one-edit noise guard (cxrxme != Chrome).
+    // There is never unbounded fuzzy edit search.
     let limit = match query.len() {
         0..=3 => return None,
-        4..=7 => 1,
+        4..=6 => 1,
         _ => 2,
     };
     // Never repair punctuation: C++, paths, brackets, and similar names remain
