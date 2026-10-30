@@ -88,8 +88,9 @@ GUI launch failures use `notify-send` when available, with details also on stder
 
 ## Interaction and state
 
-Type to filter, arrows or Tab to select, Enter to launch, Escape to dismiss, and
-Ctrl+U to clear the query. Recent launches are promoted on the next opening and
+Type to filter with subsequence matching and conservative typo tolerance, arrows
+or Tab to select, Enter to launch, Escape to dismiss, and Ctrl+U to clear the query.
+Recent launches are promoted on the next opening and
 stored in `$XDG_STATE_HOME/jofi/recent`. An advisory runtime lock prevents duplicate
 overlays. There is no telemetry or persistent background process.
 
