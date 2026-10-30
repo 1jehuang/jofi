@@ -122,3 +122,30 @@ Installed-path acceptance artifacts:
 The previous installed binary was preserved at
 `~/.jcode/scratch/jofi-before-search-correction-20261030-0937`.
 These functional checks are separate from the filter microbenchmarks above.
+
+## Launch-frequency tracking follow-up
+
+The October 30, 2026 usage-tracking follow-up adds locked, private local counts
+and timestamps for desktop entries and Rust launchers. It does not change the
+matcher or remeasure the filtering performance tables above. Empty-query
+ordering now promotes frequency, followed by last-use time and legacy recency.
+
+Validation after integrating the usage implementation (`f1963da`):
+
+- Hosted check: `20261030-025923443-1153109`, passed.
+- Hosted complete tests: `20261030-025805394-1139726`, 38 passed, 1 ignored.
+- Hosted strict all-target Clippy: `20261030-030026791-1158509`, passed.
+- Hosted release build: `20261030-025924178-1153219`, passed.
+- `shellcheck contrib/jofi-workspace` and `python3 bench/test-workspace.py`,
+  passed. The wrapper test uses fixture commands, not the user's compositor.
+- All 13 real nested-compositor cases passed against the installed release,
+  now also asserting exact persisted per-entry usage counts after launches and
+  unchanged usage on cancellation. Installed executable SHA256:
+  `4d66d984420874d2e118fea9594097d9a065479aebb4851cd7afa45cf619276d`.
+
+Integration tests additionally exercise idempotent Tofi import by unique name,
+desktop filename and full path, preserving local increments, rejecting
+ambiguous/malformed records, missing executable and compilation failures,
+12 concurrent desktop launches, and 160 threaded locked updates with private
+permissions. No actual user history, imported data, or compositor configuration
+is checked into this repository.
