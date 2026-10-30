@@ -291,8 +291,12 @@ impl EditScratch {
             row.resize(columns + 1, outside);
             row.fill(outside);
         }
-        for j in 0..=columns.min(limit) {
-            self.rows[0][j] = j;
+        for (j, cell) in self.rows[0]
+            .iter_mut()
+            .enumerate()
+            .take(columns.min(limit) + 1)
+        {
+            *cell = j;
         }
         for i in 1..=query.len() {
             let row = i % 3;
