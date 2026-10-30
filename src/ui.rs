@@ -370,6 +370,16 @@ impl Launcher {
                 self.filter();
             }
             Keysym::Left | Keysym::Right | Keysym::Home | Keysym::End => self.query.deselect(),
+            Keysym::k | Keysym::K if self.modifiers.ctrl || self.modifiers.logo => {
+                if !self.matches.is_empty() {
+                    self.selected = (self.selected + self.matches.len() - 1) % self.matches.len();
+                }
+            }
+            Keysym::j | Keysym::J if self.modifiers.ctrl || self.modifiers.logo => {
+                if !self.matches.is_empty() {
+                    self.selected = (self.selected + 1) % self.matches.len();
+                }
+            }
             Keysym::Up | Keysym::ISO_Left_Tab => {
                 if !self.matches.is_empty() {
                     self.selected = (self.selected + self.matches.len() - 1) % self.matches.len();

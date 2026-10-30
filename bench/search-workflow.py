@@ -215,6 +215,11 @@ def main():
         choose('Tab selects next result', 'term', 'Terminal Profile', ('Tab',))
         choose('Shift+Tab selects previous result', 'term', 'Terminal Profile', ('shift+Tab',))
         choose('blank query promotes most-used launcher', '', 'Terminal Profile')
+        for modifier in ['ctrl', 'super']:
+            choose(modifier + '+J selects next result', 'term', 'Terminal Profile', (modifier + '+j',))
+            choose(modifier + '+K wraps to previous result', 'term', 'Terminal Profile', (modifier + '+k',))
+            choose(modifier + '+J wraps after final result', 'term', 'Terminal', (modifier + '+j', modifier + '+j'))
+            choose(modifier + '+K wraps after first result', 'term', 'Terminal', (modifier + '+k', modifier + '+k'))
         choose('reported Vesktop double-transposition typo', 'vekstpo', 'Vesktop')
         choose('reported Firefox mixed typo with second term', 'fireofv x', 'Firefox')
         choose('Alt+Backspace deletes previous query word', 'ffx unwanted', 'Firefox', ('alt+BackSpace',))
@@ -284,6 +289,7 @@ def main():
         before = launches()
         start()
         type_text('zzzzzz')
+        key('ctrl+j', 'ctrl+k', 'super+j', 'super+k')
         key('Return')
         assert launcher.poll() is None and launches() == before, 'Enter with no matches launched or closed'
         key('ctrl+u')

@@ -125,6 +125,8 @@ GUI launch failures use `notify-send` when available, with details also on stder
 
 Type to filter with subsequence matching and conservative typo tolerance, arrows
 or Tab to select, Enter to launch, Escape to dismiss, and Ctrl+U to clear the query.
+Ctrl+J or Super+J selects the next entry; Ctrl+K or Super+K selects the previous
+entry, wrapping at either end. Plain `j` and `k` remain ordinary search text.
 Alt+A selects all query text, Alt+C copies the selection, Alt+X cuts it, and
 Alt+V pastes. Ctrl+A/C/X/V work too, including when a compositor translates the
 Alt keys into Ctrl keys. Typing or Backspace replaces/deletes selected text.
