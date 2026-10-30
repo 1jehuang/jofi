@@ -1,5 +1,7 @@
 mod catalog;
+mod clipboard;
 mod font;
+mod input;
 mod scripts;
 mod search;
 mod startup;
