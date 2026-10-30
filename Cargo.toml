@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 ab_glyph = "0.2"
-fontconfig = "0.7"
+fontconfig = { version = "0.7", features = ["dlopen"] }
+fontconfig_sys = { package = "yeslogic-fontconfig-sys", version = "5", features = ["dlopen"] }
+roxmltree = "0.21"
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
