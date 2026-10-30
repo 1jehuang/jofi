@@ -227,8 +227,10 @@ pub fn discover() -> Vec<Entry> {
     )
 }
 
-pub fn launch(entry: &Entry, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::process::CommandExt;
+pub fn prepare_launch(
+    entry: &Entry,
+    args: &[String],
+) -> Result<Command, Box<dyn std::error::Error>> {
     let mut command = match &entry.target {
         Target::Desktop(path) => {
             let mut c = Command::new("gio");
@@ -238,7 +240,7 @@ pub fn launch(entry: &Entry, args: &[String]) -> Result<(), Box<dyn std::error::
         Target::Rust(path) => Command::new(crate::scripts::compile(path, &cache_dir(), false)?),
     };
     command.args(args);
-    Err(command.exec().into())
+    Ok(command)
 }
 
 #[cfg(test)]

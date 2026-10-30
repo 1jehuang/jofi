@@ -12,7 +12,11 @@ if [[ -n "$origin" ]]; then
 fi
 workspace=$(niri msg -j workspaces 2>/dev/null | jq -r '.[] | select(.is_focused) | (.name // .idx)' || true)
 # Jofi uses its own advisory lock, never kill another launcher or prompt.
-"${JOFI_BIN:-jofi}" "$@"
+launcher=${JOFI_BIN:-"$(dirname -- "${BASH_SOURCE[0]}")/jofi"}
+if [[ -z ${JOFI_BIN:-} && ! -x "$launcher" ]]; then
+    launcher=jofi
+fi
+"$launcher" "$@"
 status=$?
 if [[ $status -eq 0 && -n "$workspace" ]]; then
     niri msg action focus-workspace "$workspace" >/dev/null 2>&1 || true

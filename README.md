@@ -57,6 +57,28 @@ Optional niri binding, replacing the existing launcher line when ready:
 Alt+Space hotkey-overlay-title="App Launcher" { spawn "jofi"; }
 ```
 
+For local desktop helpers that use `JSTACK_ORIGIN_*` context or a launcher that
+restores the original niri workspace after launching, install the optional
+wrapper (requires `bash`, `niri`, and `jq`):
+
+```sh
+install -Dm755 contrib/jofi-workspace ~/.local/bin/jofi-workspace
+```
+
+Bind it using an absolute path so the compositor's `PATH` cannot select an old
+launcher:
+
+```kdl
+Alt+Space hotkey-overlay-title="App Launcher" { spawn "/home/YOU/.local/bin/jofi-workspace"; }
+```
+
+The wrapper forwards arguments without a shell, preserves launch-origin window
+and workspace identifiers, and does not kill Tofi prompts. Back up your niri
+configuration before replacing its app-launcher binding. Other Tofi-based menus
+(power, window selection, calculator) are independent and can remain installed.
+Your existing visible `.desktop` launchers, including ones that invoke scripts,
+are discovered directly and do not need copying or conversion to Rust.
+
 ## Rust launchers
 
 Save this as `~/.config/jofi/scripts/browser.rs`:
@@ -103,9 +125,40 @@ GUI launch failures use `notify-send` when available, with details also on stder
 
 Type to filter with subsequence matching and conservative typo tolerance, arrows
 or Tab to select, Enter to launch, Escape to dismiss, and Ctrl+U to clear the query.
-Recent launches are promoted on the next opening and
-stored in `$XDG_STATE_HOME/jofi/recent`. An advisory runtime lock prevents duplicate
-overlays. There is no telemetry or persistent background process.
+Frequently launched entries are promoted on the next opening, with last-use
+time and legacy recent ordering breaking ties. Search relevance still takes
+priority over frequency. Desktop apps, desktop entries that invoke scripts, and
+native Rust launchers all use the same path-identified usage tracking.
+An advisory runtime lock prevents duplicate overlays.
+
+Usage stays **local only** in `$XDG_STATE_HOME/jofi/usage.tsv` (default
+`~/.local/state/jofi/usage.tsv`). The file stores total launch count, last-launch
+Unix milliseconds, imported count, and launcher identity. The legacy
+`jofi/recent` file remains available. Storage updates use an advisory lock and
+atomic rename, with private directory/file permissions. There is no telemetry,
+network reporting, or persistent background process. No search text or script
+arguments are saved.
+
+```sh
+jofi usage                         # Inspect stored counts and last-launch times
+jofi import-tofi ~/.local/state/tofi-drun-history
+```
+
+Import explicitly matches Tofi's `COUNT Display Name` history to unique visible
+desktop entries (full desktop paths and filenames also work). Repeating import
+does not duplicate counts, and newer larger source counts contribute only their
+increase. Local Jofi launches are preserved. Ambiguous, unavailable, hidden, or
+malformed source records are skipped and reported, not guessed or resurrected.
+The source history is never modified, and imported counts do not invent past
+launch timestamps. Existing Jofi recent ordering remains a tie-breaker even
+when no count history exists.
+
+Desktop usage is recorded after `gio launch` reports success. Rust usage is
+recorded after successful compilation and process creation, not after script
+completion. A script that later exits unsuccessfully still counts as launched.
+Compilation errors, process-creation failures, cancellation, and empty-result
+Enter do not add launches. Script execution is not monitored after the GUI
+launcher exits.
 
 Search uses an indexed optimal fuzzy matcher with word/camel-case bonuses,
 case/accent normalization, and whitespace-separated terms in any order.

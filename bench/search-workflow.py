@@ -175,6 +175,16 @@ def main():
             assert launcher.returncode == 0, f'{label}: exit {launcher.returncode}'
             history = (root / 'state/jofi/recent').read_text().splitlines()
             assert history[0] == str(entries[expected]), f'{label}: history identity mismatch'
+            usage = {}
+            for line in (root / 'state/jofi/usage.tsv').read_text().splitlines():
+                count, last, imported, identity = line.split('\t')
+                assert int(last) > 0 and int(imported) == 0, f'{label}: invalid usage metadata'
+                usage[identity] = int(count)
+            expected_usage = {}
+            for name in launches():
+                identity = str(entries[name])
+                expected_usage[identity] = expected_usage.get(identity, 0) + 1
+            assert usage == expected_usage, f'{label}: incorrect persisted launch frequencies'
             result['cases'].append({'case': label, 'query': query, 'selected': actual, 'passed': True})
         choose('transposed typo', 'chrmoe', 'Google Chrome')
         choose('unordered terms with typo', 'cdoe visual', 'Visual Studio Code')
@@ -186,7 +196,7 @@ def main():
         choose('up wraps to final result', 'term', 'Terminal Profile', ('Up',))
         choose('Tab selects next result', 'term', 'Terminal Profile', ('Tab',))
         choose('Shift+Tab selects previous result', 'term', 'Terminal Profile', ('shift+Tab',))
-        choose('blank query restores recency', '', 'Terminal Profile')
+        choose('blank query promotes most-used launcher', '', 'Terminal Profile')
         # Enter on an empty result must not close or accidentally launch the
         # previously selected app. Ctrl+U then searches from a clean selection.
         before = launches()
@@ -203,6 +213,7 @@ def main():
         result['cases'].append({'case': 'empty-result Enter and Ctrl+U recovery', 'passed': True})
         before = launches()
         history_before = (root / 'state/jofi/recent').read_bytes()
+        usage_before = (root / 'state/jofi/usage.tsv').read_bytes()
         start()
         type_text('^')
         key('Return')
@@ -210,6 +221,7 @@ def main():
         key('Escape')
         launcher.wait(timeout=5)
         assert launches() == before and (root / 'state/jofi/recent').read_bytes() == history_before
+        assert (root / 'state/jofi/usage.tsv').read_bytes() == usage_before, 'Cancellation changed usage counts'
         result['cases'].append({'case': 'literal punctuation and Escape cancellation', 'passed': True})
         result['passed'] = True
     except Exception as error:
