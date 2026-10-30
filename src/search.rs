@@ -14,6 +14,7 @@ pub type SearchMatch = (usize, Vec<usize>, i64);
 const EXACT_BONUS: i64 = 1 << 42;
 const PREFIX_BONUS: i64 = 1 << 41;
 const TYPO_PENALTY: i64 = 1 << 50;
+const SCATTER_PENALTY: i64 = 1 << 51;
 
 #[derive(Debug)]
 enum Text {
@@ -184,6 +185,7 @@ impl SearchIndex {
             let mut positions = Vec::new();
             let mut score = 0i64;
             let mut errors = 0;
+            let mut scattered = false;
             let mut found = true;
             for term in &terms {
                 self.indices.clear();
@@ -193,9 +195,27 @@ impl SearchIndex {
                 if let Some(fuzzy_score) =
                     matcher.fuzzy_indices(entry.text.as_utf32(), needle, &mut self.indices)
                 {
-                    score -= i64::from(fuzzy_score) * 1024;
-                    entry
-                        .append_positions(self.indices.iter().map(|&p| p as usize), &mut positions);
+                    let weak = weak_alignment(entry, &self.indices);
+                    // A transposed "chrmoe" must find Chrome before a scattered
+                    // c-h-r-m-o-e across "Chromium Browser". Strong literals,
+                    // compact abbreviations and boundary initials still win.
+                    let correction = if weak {
+                        typo_prefix(entry, &term.folded, &mut self.edit)
+                    } else {
+                        None
+                    };
+                    if let Some(hit) = correction {
+                        errors += hit.distance;
+                        score += hit.completion as i64 * 1024 + hit.start as i64;
+                        entry.append_positions(hit.start..hit.end, &mut positions);
+                    } else {
+                        scattered |= weak;
+                        score -= i64::from(fuzzy_score) * 1024;
+                        entry.append_positions(
+                            self.indices.iter().map(|&p| p as usize),
+                            &mut positions,
+                        );
+                    }
                 } else if let Some(hit) = typo_prefix(entry, &term.folded, &mut self.edit) {
                     errors += hit.distance;
                     score += hit.completion as i64 * 1024 + hit.start as i64;
@@ -209,13 +229,16 @@ impl SearchIndex {
                 continue;
             }
             if errors != 0 {
-                // Never let speculative typo recovery displace a literal fuzzy
-                // match. Prefer fewer edits, then stronger matching other terms.
+                // Prefer fewer corrections. Strong fuzzy matches stay ahead,
+                // but a typo may outrank a very weak scattered subsequence.
                 score += TYPO_PENALTY + errors as i64 * (1 << 30);
             } else if entry.folded == whole.folded {
                 score -= EXACT_BONUS;
             } else if entry.folded.starts_with(&whole.folded) {
                 score -= PREFIX_BONUS;
+            }
+            if scattered {
+                score += SCATTER_PENALTY;
             }
             score += entry.folded.len().min(1023) as i64;
             positions.sort_unstable();
@@ -225,6 +248,33 @@ impl SearchIndex {
         matches.sort_unstable_by_key(|entry| (entry.2, entry.0));
         matches
     }
+}
+
+/// Dense subsequences and word/camel-boundary initialisms are intentional fuzzy
+/// input. A long cross-word scatter is weaker evidence than a bounded word typo.
+fn weak_alignment(entry: &Prepared, indices: &[u32]) -> bool {
+    if indices.len() < 4 {
+        return false;
+    }
+    let span = indices.last().unwrap() - indices[0] + 1;
+    if span as usize <= indices.len().saturating_mul(2) {
+        return false;
+    }
+    let text = entry.text.as_utf32();
+    !indices.windows(2).all(|pair| {
+        let next = pair[1];
+        if next == pair[0] + 1 || next == 0 {
+            return true;
+        }
+        let previous = text.get(next - 1);
+        let current = text.get(next);
+        !previous.is_alphanumeric()
+            || (previous.is_lowercase() && current.is_uppercase())
+            || (previous.is_uppercase()
+                && current.is_uppercase()
+                && next as usize + 1 < text.len()
+                && text.get(next + 1).is_lowercase())
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
