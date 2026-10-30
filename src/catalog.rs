@@ -125,6 +125,9 @@ fn desktop_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let p = entry.path();
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
             desktop_files(root, &p, out);

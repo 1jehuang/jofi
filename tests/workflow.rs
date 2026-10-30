@@ -52,11 +52,19 @@ fn discover_compile_cache_launch_and_invalidate() {
         "[Desktop Entry]\nType=Application\nName=Fixture desktop\nExec=true\n",
     )
     .unwrap();
+    let hidden = f.0.join("data/applications/.old-backups");
+    fs::create_dir_all(&hidden).unwrap();
+    fs::write(
+        hidden.join("old.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Do not resurrect backup\nExec=true\n",
+    )
+    .unwrap();
     let listing = f.command().arg("list").output().unwrap();
     assert!(listing.status.success());
     let listing = String::from_utf8(listing.stdout).unwrap();
     assert!(listing.contains("Jofi test launcher\trust\t"));
     assert!(listing.contains("Fixture desktop\tdesktop\t"));
+    assert!(!listing.contains("Do not resurrect backup"));
     let first = f.command().arg("build").output().unwrap();
     assert!(
         first.status.success(),
