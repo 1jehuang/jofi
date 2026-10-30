@@ -177,9 +177,51 @@ fn short_queries_do_not_trigger_typo_fallback() {
     includes("Chrome", "crm");
 }
 #[test]
-fn fuzzy_always_precedes_typo_fallback() {
+fn strong_literal_fuzzy_precedes_typo_fallback() {
     let r = hits(&["Chrome", "a very long chrmoe subsequence"], "chrmoe");
     assert_eq!(r.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 0]);
+}
+
+#[test]
+fn chrome_typo_beats_weak_scatter_in_chromium_catalog() {
+    let candidates = ["Chromium Browser", "Chromium Profile", "Google Chrome"];
+    let r = hits(&candidates, "chrmoe");
+    assert_eq!(
+        r[0].0, 2,
+        "real catalog typo should choose Google Chrome: {r:?}"
+    );
+    let with_chrome = hits(
+        &[
+            "Chrome",
+            "Chromium Browser",
+            "Chromium Profile",
+            "Google Chrome",
+        ],
+        "chrmoe",
+    );
+    let position = |id| with_chrome.iter().position(|r| r.0 == id).unwrap();
+    for corrected in [0, 3] {
+        for scattered in [1, 2] {
+            assert!(
+                position(corrected) < position(scattered),
+                "bounded correction should outrank weak scatter: {with_chrome:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn long_boundary_and_camel_acronyms_remain_strong_fuzzy() {
+    // The literal acronym spans far more than twice the query length, but each
+    // skipped segment ends at a word or camel-case boundary. A compact typo
+    // candidate must not suppress those intentional abbreviation matches.
+    for name in ["Very Spacious Coding System", "VerySpaciousCodingSystem"] {
+        let r = hits(&["vscx", name], "vscs");
+        assert_eq!(
+            r[0].0, 1,
+            "boundary acronym must outrank typo for {name}: {r:?}"
+        );
+    }
 }
 #[test]
 fn repeated_tokens_have_safe_deduplicated_highlights() {
