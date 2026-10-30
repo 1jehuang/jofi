@@ -20,6 +20,12 @@ const MAGIC: &[u8] = b"jofi-font-match-v1\0";
 const LIMIT: usize = 100_000;
 type Stamp = [u64; 11];
 
+fn diagnostic(message: std::fmt::Arguments<'_>) {
+    if std::env::var_os("JOFI_PROFILE_STARTUP").is_some() {
+        eprintln!("jofi font cache: {message}");
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Dependency {
     path: PathBuf,
@@ -206,6 +212,7 @@ fn configuration_roots() -> Option<Vec<PathBuf>> {
     // Sysroot remapping varies across Fontconfig releases. Fail closed instead
     // of treating a host path as a dependency of a remapped configuration.
     if std::env::var_os("FONTCONFIG_SYSROOT").is_some_and(|v| !v.is_empty()) {
+        diagnostic(format_args!("not cached: FONTCONFIG_SYSROOT remapping"));
         return None;
     }
     let mut roots = default_roots();
@@ -249,6 +256,7 @@ fn configuration_roots() -> Option<Vec<PathBuf>> {
         }
     }
     if !complete {
+        diagnostic(format_args!("Fontconfig dependency enumeration failed"));
         return None;
     }
     let home = std::env::var_os("HOME")
@@ -257,46 +265,81 @@ fn configuration_roots() -> Option<Vec<PathBuf>> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
+    let resolve = |name: &str| {
+        let name = std::ffi::CString::new(name).ok()?;
+        // SAFETY: successful FcInit precedes this closure. The returned owned
+        // string is copied and freed with the matching Fontconfig allocator.
+        unsafe {
+            let path = (LIB.FcConfigFilename)(name.as_ptr().cast());
+            if path.is_null() {
+                return None;
+            }
+            let owned = PathBuf::from(OsString::from_vec(
+                CStr::from_ptr(path.cast()).to_bytes().to_vec(),
+            ));
+            (LIB.FcStrFree)(path);
+            Some(owned)
+        }
+    };
+    // With no FONTCONFIG_PATH override, FcConfigFilename searches exactly its
+    // compiled-in directory. Querying "." reveals that directory even when an
+    // optional include (e.g. the default local.conf) does not exist. Never guess
+    // /etc/fonts: distributions and installations can use a different root.
+    let default_search = if std::env::var_os("FONTCONFIG_PATH").is_none_or(|v| v.is_empty()) {
+        resolve(".")
+    } else {
+        None
+    };
+    if let Some(root) = &default_search {
+        roots.push(root.clone());
+    }
     for file in files {
-        let metadata = fs::metadata(&file).ok()?;
+        let metadata = fs::metadata(&file)
+            .map_err(|e| diagnostic(format_args!("stat {}: {e}", file.display())))
+            .ok()?;
         if metadata.is_dir() {
             continue;
         }
         if !metadata.is_file() {
             return None;
         }
-        let xml = fs::read_to_string(&file).ok()?;
-        roots.extend(include_roots(&xml, &home, &xdg, &|name| {
-            let name = std::ffi::CString::new(name).ok()?;
-            // SAFETY: called only after successful FcInit. CString lives through
-            // the call. FcConfigFilename returns a newly allocated string that
-            // must be freed using FcStrFree, not Rust or libc allocators.
-            unsafe {
-                let path = (LIB.FcConfigFilename)(name.as_ptr().cast());
-                if path.is_null() {
-                    return None;
-                }
-                let owned = PathBuf::from(OsString::from_vec(
-                    CStr::from_ptr(path.cast()).to_bytes().to_vec(),
+        let xml = fs::read_to_string(&file)
+            .map_err(|e| diagnostic(format_args!("read config {}: {e}", file.display())))
+            .ok()?;
+        roots.extend(
+            include_roots(&xml, &home, &xdg, &|name| {
+                resolve(name).or_else(|| default_search.as_ref().map(|root| root.join(name)))
+            })
+            .or_else(|| {
+                diagnostic(format_args!(
+                    "cannot track XML include in {}",
+                    file.display()
                 ));
-                (LIB.FcStrFree)(path);
-                Some(owned)
-            }
-        })?);
+                None
+            })?,
+        );
     }
     Some(roots)
 }
 
 /// Fontconfig omits missing includes from GetConfigFiles. Parse loaded XML on
 /// the cold path to watch absolute, home and XDG missing includes as well. An
-/// unresolved relative include has an opaque compiled-in search path, so do
-/// not cache that configuration rather than silently miss a future creation.
+/// unresolved relative include must be supplied as a missing candidate by the
+/// resolver. If its search path is opaque, do not cache that configuration.
 fn include_roots(
     xml: &str,
     home: &Path,
     xdg: &Path,
     resolve: &impl Fn(&str) -> Option<PathBuf>,
 ) -> Option<Vec<PathBuf>> {
+    // Fontconfig parses XML without namespace processing, so valid Fontconfig
+    // files may contain unbound xsi:nil attributes rejected by roxmltree. Files
+    // with no include token and no entity declarations cannot introduce include
+    // dependencies: XML names cannot contain character/entity references. Their
+    // contents are still fully metadata-watched, without reinterpreting rules.
+    if !xml.contains("<include") && !xml.contains("<!ENTITY") {
+        return Some(Vec::new());
+    }
     let document = roxmltree::Document::parse_with_options(
         xml,
         roxmltree::ParsingOptions {
@@ -304,6 +347,7 @@ fn include_roots(
             ..Default::default()
         },
     )
+    .map_err(|error| diagnostic(format_args!("include XML parse: {error}")))
     .ok()?;
     let mut roots = Vec::new();
     for node in document
@@ -429,16 +473,24 @@ impl Manifest {
     }
 
     fn valid(&self, key: &[u8]) -> bool {
-        self.key == key
-            && self
-                .dependencies
-                .iter()
-                .all(|dep| dependency(&dep.path).is_ok_and(|(now, _)| now == *dep))
+        if self.key != key {
+            diagnostic(format_args!("environment or cwd changed"));
+            return false;
+        }
+        self.dependencies.iter().all(|dep| {
+            let valid = dependency(&dep.path).is_ok_and(|(now, _)| now == *dep);
+            if !valid {
+                diagnostic(format_args!("dependency changed: {}", dep.path.display()));
+            }
+            valid
+        })
     }
 }
 
 fn read_manifest(path: &Path, key: &[u8]) -> Option<Manifest> {
-    let file = fs::File::open(path).ok()?;
+    let file = fs::File::open(path)
+        .map_err(|e| diagnostic(format_args!("open {}: {e}", path.display())))
+        .ok()?;
     use std::io::Read;
     let mut bytes = Vec::new();
     file.take(32 * 1024 * 1024 + 1)
@@ -447,7 +499,10 @@ fn read_manifest(path: &Path, key: &[u8]) -> Option<Manifest> {
     if bytes.len() > 32 * 1024 * 1024 {
         return None;
     }
-    let manifest = Manifest::decode(&bytes)?;
+    let manifest = Manifest::decode(&bytes).or_else(|| {
+        diagnostic(format_args!("corrupt or incompatible manifest"));
+        None
+    })?;
     manifest.valid(key).then_some(manifest)
 }
 
@@ -489,27 +544,41 @@ fn fresh_match(key: Vec<u8>, cache: &Path) -> Result<(PathBuf, u32), Box<dyn Err
     let index = matched.index.unwrap_or(0).try_into()?;
     if let Some(mut roots) = configuration_roots() {
         roots.push(matched.path.clone());
-        if let Ok(dependencies) = snapshot(&roots) {
-            // Do not cache a match if any dependency changed during FcInit/find.
-            // The snapshot must describe the data actually used, not a newer edit.
-            let stable = dependencies
-                .iter()
-                .flat_map(|d| [&d.link, &d.target])
-                .flatten()
-                .all(|s| {
-                    [7, 9]
-                        .iter()
-                        .all(|&i| u128::from(s[i]) * 1_000_000_000 + u128::from(s[i + 1]) < begin)
-                });
-            let manifest = Manifest {
-                key,
-                font: matched.path.clone(),
-                index,
-                dependencies,
-            };
-            if stable && manifest.valid(&manifest.key) {
-                let _ = write_manifest(cache, &manifest);
+        match snapshot(&roots) {
+            Ok(dependencies) => {
+                // Do not cache a match if any dependency changed during FcInit/find.
+                // The snapshot must describe the data actually used, not a newer edit.
+                let stable = dependencies
+                    .iter()
+                    .flat_map(|d| [&d.link, &d.target])
+                    .flatten()
+                    .all(|s| {
+                        [7, 9].iter().all(|&i| {
+                            u128::from(s[i]) * 1_000_000_000 + u128::from(s[i + 1]) < begin
+                        })
+                    });
+                let manifest = Manifest {
+                    key,
+                    font: matched.path.clone(),
+                    index,
+                    dependencies,
+                };
+                if !stable {
+                    diagnostic(format_args!("dependency timestamp changed during matching"));
+                }
+                if stable && manifest.valid(&manifest.key) {
+                    match write_manifest(cache, &manifest) {
+                        Ok(()) => diagnostic(format_args!(
+                            "stored {} dependencies",
+                            manifest.dependencies.len()
+                        )),
+                        Err(error) => {
+                            diagnostic(format_args!("write {}: {error}", cache.display()))
+                        }
+                    }
+                }
             }
+            Err(error) => diagnostic(format_args!("dependency snapshot: {error}")),
         }
     }
     Ok((matched.path, index))
@@ -683,7 +752,40 @@ mod tests {
             &|_| None
         )
         .is_none());
-        assert!(include_roots("broken XML", &home, &xdg, &|_| None).is_none());
+        assert!(include_roots("<include broken XML", &home, &xdg, &|_| None).is_none());
+    }
+
+    #[test]
+    fn missing_default_local_include_is_a_dependency() {
+        assert_eq!(
+            include_roots(
+                r#"<fontconfig><match><test><const xsi:nil="true"/></test></match></fontconfig>"#,
+                Path::new("/home"),
+                Path::new("/xdg"),
+                &|_| None
+            ),
+            Some(vec![])
+        );
+        let f = Fixture::new();
+        let config = f.0.join("custom-fontconfig-install");
+        fs::create_dir(&config).unwrap();
+        let roots = include_roots(
+            r#"<fontconfig><include ignore_missing="yes">local.conf</include></fontconfig>"#,
+            &f.0,
+            &f.0,
+            &|name| Some(config.join(name)),
+        )
+        .unwrap();
+        assert_eq!(roots, vec![config.join("local.conf")]);
+        let manifest = Manifest {
+            key: vec![],
+            font: roots[0].clone(),
+            index: 0,
+            dependencies: snapshot(&roots).unwrap(),
+        };
+        assert!(manifest.valid(&[]));
+        fs::write(&roots[0], b"new rules").unwrap();
+        assert!(!manifest.valid(&[]));
     }
 
     #[test]
@@ -728,6 +830,21 @@ mod tests {
             String::from_utf8(output.stdout).unwrap()
         );
         assert!(load().is_ok());
+        let cache = crate::catalog::cache_dir().join("font-match");
+        let key = environment_key();
+        let manifest = read_manifest(&cache, &key)
+            .expect("first load must create a valid warm cache for the native config");
+        assert_eq!((manifest.font, manifest.index), (path, index));
+        let before = fs::metadata(&cache).unwrap().modified().unwrap();
         assert!(load().is_ok());
+        assert!(
+            read_manifest(&cache, &key).is_some(),
+            "second load must retain a valid manifest"
+        );
+        assert_eq!(
+            before,
+            fs::metadata(&cache).unwrap().modified().unwrap(),
+            "second load must hit, not rewrite, the cache"
+        );
     }
 }
