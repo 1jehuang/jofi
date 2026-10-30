@@ -1,145 +1,98 @@
-# jofi
+# Jofi
 
-`jofi` is a fast, typo-resistant application launcher focused only on `.desktop` entries.
+A small, native Rust application launcher for Wayland. A fresh implementation,
+not a wrapper around tofi. Uses a layer-shell overlay, shared-memory software
+rendering, and no browser engine, GPU toolkit, or background daemon.
 
-The first milestone is the engine and profiler:
+## What it launches
 
-- discover launchable `.desktop` files
-- treat user scripts wrapped by `.desktop` files as first-class launcher entries
-- rank with typo-resistant search
-- build launch commands from `Exec` safely without a shell
-- log performance and memory telemetry as JSONL
+- Normal `.desktop` apps from `$XDG_DATA_HOME/applications` and
+  `$XDG_DATA_DIRS/applications`, including Flatpak directories when present in
+  `XDG_DATA_DIRS`. User overrides, hidden entries, desktop visibility, and
+  `TryExec` are respected. Desktop launch semantics are delegated to `gio launch`
+  rather than interpreting `Exec` as a shell command.
+- Standalone Rust programs from `~/.config/jofi/scripts/*.rs`. They do **not**
+  need a `.desktop` file or installation into a standard app directory.
+  Override the directory with `JOFI_SCRIPTS_DIR`.
 
-The Wayland UI comes next. This repo intentionally does **not** aim to be a full `tofi`, `rofi`, or `dmenu` replacement.
+The default UI matches the existing tofi setup: fullscreen translucent black,
+monospace white text, tomato selection, orange-red matches, 35% left/top inset,
+and five visible results. Uses the `launcher` layer namespace so an existing
+niri blur rule matching `^(tofi|launcher)$` also applies to Jofi.
 
-## Scope
+## Build and install
 
-Included:
-
-- `.desktop` application discovery
-- `Name`, `GenericName`, `Comment`, `Keywords`, `Categories`, `Exec`, `Icon`, `Terminal`
-- typo-resistant search with prefix, acronym, substring, subsequence, and Damerau-Levenshtein scoring
-- direct launching
-- first-class profiling/telemetry
-
-Excluded from the product vision:
-
-- stdin/dmenu mode
-- raw `$PATH` executable launcher
-- rofi/dmenu compatibility flags
-- stdout selection protocol
-- giant theming/config system
-
-## Usage
-
-Open the graphical Wayland launcher:
+Requires Rust, Wayland, fontconfig (`fc-match`), a monospace font, and development
+libraries for Wayland and xkbcommon. `gio` is required to launch desktop entries.
+On Arch: `pacman -S rust wayland libxkbcommon fontconfig glib2`.
 
 ```sh
-cargo run --release
-# or explicitly:
-cargo run --release -- run
+justrust check
+justrust test
+justrust build --release
+install -Dm755 target/release/jofi ~/.local/bin/jofi
+mkdir -p ~/.config/jofi/scripts
+jofi
 ```
 
-The v1 UI is intentionally minimal:
+Plain Cargo also works outside this development environment. The compositor must
+support `wlr-layer-shell`, as niri does. No X11 fallback is provided.
 
-- fullscreen dim transparent overlay
-- centered text only
-- no boxes, borders, icons, placeholder, caret, or blur
-- typed query appears only when non-empty
-- five visible entries by default
-- selected entry is color-coded
+Optional niri binding, replacing the existing launcher line when ready:
 
-CLI/debug commands:
+```kdl
+Alt+Space hotkey-overlay-title="App Launcher" { spawn "jofi"; }
+```
+
+## Rust launchers
+
+Save this as `~/.config/jofi/scripts/browser.rs`:
+
+```rust
+// jofi-name: Browser work profile
+use std::{io, os::unix::process::CommandExt, process::Command};
+
+fn main() -> io::Result<()> {
+    Err(Command::new("firefox").arg("-P").arg("work").exec())
+}
+```
+
+The optional `// jofi-name:` comment controls the displayed name. Otherwise the
+filename is used, with hyphens and underscores converted to spaces.
 
 ```sh
-cargo run -- profile
-cargo run -- search chrmoe
-cargo run -- launch firefox --dry-run
-cargo run -- list --limit 20
+jofi build                    # Precompile all scripts after edits
+jofi build --force            # Rebuild, e.g. after changing Rust toolchains
+jofi launch 'Browser work profile'
+jofi list                     # Names, source types, and paths
+jofi paths                    # Resolved source/cache directories
 ```
 
-UI options:
+Compilation happens only when explicitly building or selecting an uncached
+script, never while opening the menu or searching. A cache hit runs the existing
+binary. Source-directory contents are fingerprinted so edits to local modules
+and assets also invalidate the cache. Binaries are published with atomic rename,
+so failed or concurrent builds cannot leave a partially written cached binary.
+The cache lives under `$XDG_CACHE_HOME/jofi/bin` (default `~/.cache/jofi/bin`).
 
-```sh
-jofi --background-alpha 170 --query-size 34 --result-size 28 --result-gap 25 --ui-results 5
-jofi --x-percent 0.35 --y-percent 0.35 --render-scale 2
-jofi --font /usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf
-```
+Scripts use Rust 2021 and `std` only, without a Cargo manifest or third-party
+crate dependencies. Local `mod` and relative include files work. Put helper `.rs`
+files in a subdirectory so they are not indexed as separate launchers. External
+files and symlinked directories are not dependency-tracked. Run `jofi build
+--force` after changing those or changing the compiler. Keep the scripts directory
+small because its contents are read when checking a script cache entry.
 
-On first run, `jofi` imports tofi's drun history from:
+Scripts are **trusted local executable code**, not sandboxed. Do not install
+untrusted launchers. Jofi never executes a script merely to discover its name.
+GUI launch failures use `notify-send` when available, with details also on stderr.
 
-```text
-$XDG_STATE_HOME/tofi-drun-history
-```
+## Interaction and state
 
-into:
+Type to filter, arrows or Tab to select, Enter to launch, Escape to dismiss, and
+Ctrl+U to clear the query. Recent launches are promoted on the next opening and
+stored in `$XDG_STATE_HOME/jofi/recent`. An advisory runtime lock prevents duplicate
+overlays. There is no telemetry or persistent background process.
 
-```text
-$XDG_STATE_HOME/jofi/history
-```
-
-Then it keeps updating the jofi history file on launches.
-
-Telemetry is on by default and logs JSONL to:
-
-```text
-$XDG_STATE_HOME/jofi/telemetry.jsonl
-```
-
-Disable it with:
-
-```sh
-jofi --no-telemetry search firefox
-```
-
-or choose another path:
-
-```sh
-jofi --telemetry-log /tmp/jofi.jsonl profile
-```
-
-## Profiling
-
-```sh
-cargo run --release -- profile \
-  --query firefox \
-  --query chrmoe \
-  --query hotspot \
-  --runs 1000
-```
-
-The profile command prints discovery time, index-build time, search timing, RSS memory, virtual memory, and the telemetry log path.
-
-Each telemetry span records:
-
-- `duration_ns`
-- `rss_kib`
-- `vm_size_kib`
-- `rss_delta_kib`
-- `vm_size_delta_kib`
-- span-specific fields, such as entry counts and query result counts
-
-## Script launcher entries
-
-Recommended script workflow:
-
-```text
-~/.local/bin/play-song
-~/.local/share/applications/play-song.desktop
-```
-
-Example `.desktop` file:
-
-```ini
-[Desktop Entry]
-Type=Application
-Name=Play Song
-Comment=Play my default music
-Exec=/home/jeremy/.local/bin/play-song
-Icon=media-playback-start
-Terminal=false
-Categories=Utility;
-Keywords=music;song;audio;
-```
-
-`jofi` indexes this exactly like a normal app, with strong `Name` and `Keywords` ranking.
+This intentionally starts small: no icon grid, theme language, dependency
+resolver for scripts, stdin menu mode, or tofi compatibility layer. Existing
+compositor-specific shell wrapper behavior is not automatically imported.

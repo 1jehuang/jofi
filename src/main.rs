@@ -1,482 +1,171 @@
-use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
-use jofi::desktop::{DiscoveryOptions, discover_desktop_entries};
-use jofi::history::History;
-use jofi::launcher::{build_launch_command, launch};
-use jofi::search::{SearchIndex, SearchResult};
-use jofi::telemetry::{MemorySnapshot, Telemetry, default_telemetry_path};
-use jofi::ui::{UiOptions, run_launcher};
-use serde::Serialize;
-use serde_json::{Map, json};
-use std::path::PathBuf;
-use std::time::Instant;
+mod catalog;
+mod scripts;
+mod ui;
 
-#[derive(Debug, Parser)]
-#[command(author, version, about)]
-struct Cli {
-    /// Disable telemetry logging for this invocation.
-    #[arg(long, global = true)]
-    no_telemetry: bool,
+use std::{env, fs, path::PathBuf};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-    /// Telemetry JSONL file path. Defaults to $XDG_STATE_HOME/jofi/telemetry.jsonl.
-    #[arg(long, global = true)]
-    telemetry_log: Option<PathBuf>,
-
-    /// Include NoDisplay=true desktop entries.
-    #[arg(long, global = true)]
-    include_hidden: bool,
-
-    #[command(flatten)]
-    ui: UiArgs,
-
-    #[command(subcommand)]
-    command: Option<Command>,
+fn usage() {
+    println!("jofi: minimal native Wayland app launcher\n\n  jofi                      Open launcher\n  jofi list                 List desktop apps and Rust scripts\n  jofi launch NAME [ARGS]   Launch an exact, unambiguous name\n  jofi build [--force]      Precompile Rust launchers\n  jofi paths                Show script and cache locations\n\nRust scripts: ~/.config/jofi/scripts/*.rs (or JOFI_SCRIPTS_DIR)\nOptional first-line metadata: // jofi-name: My app\nKeys: type to search, Up/Down or Tab to select, Enter to launch, Esc to close");
 }
-
-#[derive(Debug, Args, Clone)]
-struct UiArgs {
-    /// Font file to use for the Wayland UI. Also configurable with JOFI_FONT.
-    #[arg(long)]
-    font: Option<PathBuf>,
-
-    /// Fullscreen background opacity from 0-255. Defaults to tofi's #000A alpha.
-    #[arg(long, default_value_t = 170)]
-    background_alpha: u8,
-
-    /// Query text size in physical pixels.
-    #[arg(long, default_value_t = 34.0)]
-    query_size: f32,
-
-    /// Result text size in physical pixels.
-    #[arg(long, default_value_t = 28.0)]
-    result_size: f32,
-
-    /// Vertical gap between result entries in physical pixels.
-    #[arg(long, default_value_t = 25.0)]
-    result_gap: f32,
-
-    /// Horizontal text start position as a fraction of screen width.
-    #[arg(long, default_value_t = 0.35)]
-    x_percent: f32,
-
-    /// Vertical text start position as a fraction of screen height.
-    #[arg(long, default_value_t = 0.35)]
-    y_percent: f32,
-
-    /// Integer Wayland buffer scale. Higher values render sharper text at the cost of draw time.
-    #[arg(long, default_value_t = 3)]
-    render_scale: u32,
-
-    /// Maximum visible launcher results.
-    #[arg(long, default_value_t = 5)]
-    ui_results: usize,
+fn identity(entry: &catalog::Entry) -> String {
+    match &entry.target {
+        catalog::Target::Desktop(p) | catalog::Target::Rust(p) => p.to_string_lossy().into_owned(),
+    }
 }
-
-impl From<UiArgs> for UiOptions {
-    fn from(args: UiArgs) -> Self {
-        UiOptions {
-            font_path: args.font,
-            background_alpha: args.background_alpha,
-            query_size_px: args.query_size,
-            result_size_px: args.result_size,
-            result_gap_px: args.result_gap,
-            x_percent: args.x_percent,
-            y_percent: args.y_percent,
-            render_scale: args.render_scale.max(1),
-            max_results: args.ui_results,
+fn history_path() -> PathBuf {
+    catalog::home_dir("XDG_STATE_HOME", ".local/state").join("jofi/recent")
+}
+fn record(entry: &catalog::Entry) {
+    let path = history_path();
+    let id = identity(entry);
+    if id.contains(['\n', '\r']) {
+        return;
+    }
+    let previous = fs::read_to_string(&path).unwrap_or_default();
+    let lines: Vec<_> = std::iter::once(id.as_str())
+        .chain(previous.lines().filter(|s| *s != id))
+        .take(100)
+        .collect();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    if fs::write(&temporary, lines.join("\n")).is_ok() {
+        let _ = fs::rename(temporary, path);
+    }
+}
+fn run() -> Result<()> {
+    let args: Vec<_> = env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h" | "help") => {
+            usage();
+            return Ok(());
         }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Open the graphical Wayland launcher UI.
-    Run(UiArgs),
-    /// List indexed desktop entries.
-    List(OutputArgs),
-    /// Search desktop entries with jofi's typo-resistant ranker.
-    Search(SearchArgs),
-    /// Launch the best matching desktop entry.
-    Launch(LaunchArgs),
-    /// Run indexing/search performance probes and print timing + memory metrics.
-    Profile(ProfileArgs),
-}
-
-#[derive(Debug, Args)]
-struct OutputArgs {
-    /// Output JSON instead of a compact text table.
-    #[arg(long)]
-    json: bool,
-
-    /// Maximum entries to print.
-    #[arg(long, default_value_t = 100)]
-    limit: usize,
-}
-
-#[derive(Debug, Args)]
-struct SearchArgs {
-    /// Search query.
-    query: String,
-
-    /// Maximum results to print.
-    #[arg(short, long, default_value_t = 10)]
-    limit: usize,
-
-    /// Output JSON instead of a compact text table.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct LaunchArgs {
-    /// Search query. The highest-ranked result is launched.
-    query: String,
-
-    /// Print the launch command instead of executing it.
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Output JSON for dry-run/selection details.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct ProfileArgs {
-    /// Queries to benchmark. Can be supplied more than once.
-    #[arg(short, long)]
-    query: Vec<String>,
-
-    /// Number of timed search repetitions per query.
-    #[arg(short, long, default_value_t = 200)]
-    runs: usize,
-
-    /// Maximum search results produced per run.
-    #[arg(short, long, default_value_t = 10)]
-    limit: usize,
-
-    /// Output JSON instead of human-readable text.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ProfileReport {
-    entries: usize,
-    discovery_ns: u128,
-    index_build_ns: u128,
-    search_reports: Vec<QueryProfile>,
-    memory: MemorySnapshot,
-    telemetry_log: Option<PathBuf>,
-}
-
-#[derive(Debug, Serialize)]
-struct QueryProfile {
-    query: String,
-    runs: usize,
-    avg_ns: f64,
-    min_ns: u128,
-    max_ns: u128,
-    result_count: usize,
-    best_match: Option<String>,
-}
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let telemetry_path =
-        (!cli.no_telemetry).then(|| cli.telemetry_log.unwrap_or_else(default_telemetry_path));
-    let telemetry = Telemetry::new(telemetry_path)?;
-    let discovery_options = DiscoveryOptions {
-        include_hidden: cli.include_hidden,
-    };
-
-    match cli.command {
-        Some(Command::Run(args)) => cmd_run(args, &discovery_options, telemetry),
-        Some(Command::List(args)) => cmd_list(args, &discovery_options, &telemetry),
-        Some(Command::Search(args)) => cmd_search(args, &discovery_options, &telemetry),
-        Some(Command::Launch(args)) => cmd_launch(args, &discovery_options, &telemetry),
-        Some(Command::Profile(args)) => cmd_profile(args, &discovery_options, &telemetry),
-        None => cmd_run(cli.ui, &discovery_options, telemetry),
-    }
-}
-
-fn cmd_run(args: UiArgs, options: &DiscoveryOptions, telemetry: Telemetry) -> Result<()> {
-    let history = load_history(&telemetry)?;
-    let index = load_index_with_history(options, &telemetry, &history)?;
-    run_launcher(index, telemetry, args.into(), history)
-}
-
-fn load_history(telemetry: &Telemetry) -> Result<History> {
-    let mut span = telemetry.span("history.load");
-    let history = History::load_with_tofi_fallback()?;
-    span.set_field("entries", history.len());
-    Ok(history)
-}
-
-fn load_index(options: &DiscoveryOptions, telemetry: &Telemetry) -> Result<SearchIndex> {
-    let history = load_history(telemetry)?;
-    load_index_with_history(options, telemetry, &history)
-}
-
-fn load_index_with_history(
-    options: &DiscoveryOptions,
-    telemetry: &Telemetry,
-    history: &History,
-) -> Result<SearchIndex> {
-    let entries = {
-        let mut span = telemetry.span("desktop.discover");
-        let entries = discover_desktop_entries(options)?;
-        span.set_field("entries", entries.len());
-        entries
-    };
-
-    let index = {
-        let mut span = telemetry.span("search.index_build");
-        let index = SearchIndex::with_history(entries, history);
-        span.set_field("entries", index.len());
-        index
-    };
-    Ok(index)
-}
-
-fn cmd_list(args: OutputArgs, options: &DiscoveryOptions, telemetry: &Telemetry) -> Result<()> {
-    let index = load_index(options, telemetry)?;
-    let entries = index.entries().take(args.limit).collect::<Vec<_>>();
-    if args.json {
-        serde_json::to_writer_pretty(std::io::stdout(), &entries)?;
-        println!();
-        return Ok(());
-    }
-
-    println!("{:<42} {:<8} Exec", "Name", "Terminal");
-    println!("{:-<42} {:-<8} {:-<30}", "", "", "");
-    for entry in entries {
-        println!(
-            "{:<42} {:<8} {}",
-            truncate(&entry.name, 42),
-            entry.terminal,
-            truncate(&entry.exec, 90)
-        );
-    }
-    Ok(())
-}
-
-fn cmd_search(args: SearchArgs, options: &DiscoveryOptions, telemetry: &Telemetry) -> Result<()> {
-    let index = load_index(options, telemetry)?;
-    let results = {
-        let mut span = telemetry.span("search.query").field("query", &args.query);
-        let results = index.search(&args.query, args.limit);
-        span.set_field("results", results.len());
-        results
-    };
-
-    if args.json {
-        serde_json::to_writer_pretty(std::io::stdout(), &results)?;
-        println!();
-        return Ok(());
-    }
-    print_results(&results);
-    Ok(())
-}
-
-fn cmd_launch(args: LaunchArgs, options: &DiscoveryOptions, telemetry: &Telemetry) -> Result<()> {
-    let index = load_index(options, telemetry)?;
-    let mut results = {
-        let mut span = telemetry.span("search.query").field("query", &args.query);
-        let results = index.search(&args.query, 1);
-        span.set_field("results", results.len());
-        results
-    };
-    let result = results
-        .pop()
-        .with_context(|| format!("no desktop entry matched query {:?}", args.query))?;
-    let command = build_launch_command(&result.entry)?;
-
-    if args.dry_run {
-        if args.json {
-            let payload = json!({
-                "selected": result,
-                "command": command,
-                "telemetry_log": telemetry.path(),
-            });
-            serde_json::to_writer_pretty(std::io::stdout(), &payload)?;
-            println!();
-        } else {
-            println!("selected: {}", result.entry.name);
-            println!("score: {}", result.score);
-            println!("command: {}", shell_words::join(command.as_vec()));
+        Some("--version" | "-V") => {
+            println!("jofi {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
         }
-        return Ok(());
+        Some("paths") => {
+            println!(
+                "scripts: {}\ncache: {}",
+                catalog::scripts_dir().display(),
+                catalog::cache_dir().display()
+            );
+            return Ok(());
+        }
+        _ => {}
     }
-
-    let mut fields = Map::new();
-    fields.insert("entry".to_string(), json!(result.entry.name));
-    fields.insert("query".to_string(), json!(args.query));
-    fields.insert("command".to_string(), json!(command.as_vec()));
-    telemetry.event("launch.selected", fields);
-
-    let mut span = telemetry
-        .span("launch.spawn")
-        .field("entry", &result.entry.name);
-    let child = launch(&result.entry)?;
-    let mut history = History::load_with_tofi_fallback()?;
-    history.increment(&result.entry.name);
-    if let Err(err) = history.save() {
-        let mut fields = Map::new();
-        fields.insert("entry".to_string(), json!(result.entry.name));
-        fields.insert("error".to_string(), json!(err.to_string()));
-        telemetry.event("history.save_error", fields);
-    }
-    span.set_field("child_pid", child.id());
-    drop(child);
-    Ok(())
-}
-
-fn cmd_profile(args: ProfileArgs, options: &DiscoveryOptions, telemetry: &Telemetry) -> Result<()> {
-    if args.runs == 0 {
-        bail!("--runs must be greater than zero");
-    }
-
-    let discovery_start = Instant::now();
-    let entries = {
-        let mut span = telemetry.span("profile.desktop.discover");
-        let entries = discover_desktop_entries(options)?;
-        span.set_field("entries", entries.len());
-        entries
-    };
-    let discovery_ns = discovery_start.elapsed().as_nanos();
-
-    let index_start = Instant::now();
-    let index = {
-        let mut span = telemetry.span("profile.search.index_build");
-        let index = SearchIndex::new(entries);
-        span.set_field("entries", index.len());
-        index
-    };
-    let index_build_ns = index_start.elapsed().as_nanos();
-
-    let queries = if args.query.is_empty() {
-        vec![
-            "firefox".to_string(),
-            "chrmoe".to_string(),
-            "hotspot".to_string(),
-        ]
-    } else {
-        args.query
-    };
-
-    let mut search_reports = Vec::new();
-    for query in queries {
-        let mut total = 0_u128;
-        let mut min = u128::MAX;
-        let mut max = 0_u128;
-        let mut last_results = Vec::new();
-        {
-            let mut span = telemetry
-                .span("profile.search.query")
-                .field("query", &query)
-                .field("runs", args.runs);
-            for _ in 0..args.runs {
-                let start = Instant::now();
-                last_results = index.search(&query, args.limit);
-                let elapsed = start.elapsed().as_nanos();
-                total += elapsed;
-                min = min.min(elapsed);
-                max = max.max(elapsed);
+    let mut entries = catalog::discover();
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            for entry in entries {
+                println!(
+                    "{}\t{}\t{}",
+                    entry.name,
+                    match entry.target {
+                        catalog::Target::Desktop(_) => "desktop",
+                        catalog::Target::Rust(_) => "rust",
+                    },
+                    identity(&entry)
+                );
             }
-            span.set_field("results_last_run", last_results.len());
-            span.set_field("avg_ns", total as f64 / args.runs as f64);
         }
-        search_reports.push(QueryProfile {
-            query,
-            runs: args.runs,
-            avg_ns: total as f64 / args.runs as f64,
-            min_ns: min,
-            max_ns: max,
-            result_count: last_results.len(),
-            best_match: last_results.first().map(|r| r.entry.name.clone()),
-        });
-    }
-
-    let report = ProfileReport {
-        entries: index.len(),
-        discovery_ns,
-        index_build_ns,
-        search_reports,
-        memory: MemorySnapshot::current(),
-        telemetry_log: telemetry.path().map(PathBuf::from),
-    };
-
-    if args.json {
-        serde_json::to_writer_pretty(std::io::stdout(), &report)?;
-        println!();
-    } else {
-        print_profile_report(&report);
+        Some("build") => {
+            if args.iter().skip(1).any(|s| s != "--force") {
+                return Err("usage: jofi build [--force]".into());
+            }
+            let mut failures = Vec::new();
+            for entry in entries {
+                if let catalog::Target::Rust(path) = entry.target {
+                    match scripts::compile(
+                        &path,
+                        &catalog::cache_dir(),
+                        args.iter().any(|s| s == "--force"),
+                    ) {
+                        Ok(binary) => println!("{}\t{}", entry.name, binary.display()),
+                        Err(e) => failures.push(format!("{}: {e}", entry.name)),
+                    }
+                }
+            }
+            if !failures.is_empty() {
+                return Err(failures.join("\n").into());
+            }
+        }
+        Some("launch") => {
+            let name = args.get(1).ok_or("usage: jofi launch NAME [ARGS]")?;
+            let matches: Vec<_> = entries
+                .iter()
+                .filter(|e| e.name.eq_ignore_ascii_case(name))
+                .collect();
+            if matches.len() != 1 {
+                return Err(format!(
+                    "expected one entry named {name:?}, found {}. Use jofi list to inspect names",
+                    matches.len()
+                )
+                .into());
+            }
+            record(matches[0]);
+            catalog::launch(matches[0], &args[2..])?;
+        }
+        None | Some("run") => {
+            // An advisory lock lives only while the overlay is open. Crashes release it.
+            let runtime = env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .ok_or("XDG_RUNTIME_DIR is required for Wayland")?;
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(runtime.join("jofi.lock"))?;
+            if lock.try_lock().is_err() {
+                return Ok(());
+            }
+            let recent = fs::read_to_string(history_path()).unwrap_or_default();
+            entries.sort_by_cached_key(|e| {
+                recent
+                    .lines()
+                    .position(|line| line == identity(e))
+                    .unwrap_or(usize::MAX)
+            });
+            let mut names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
+            for (i, entry) in entries.iter().enumerate() {
+                if entries.iter().filter(|e| e.name == entry.name).count() > 1 {
+                    names[i] = format!(
+                        "{} [{}]",
+                        entry.name,
+                        match &entry.target {
+                            catalog::Target::Rust(_) => "Rust".into(),
+                            catalog::Target::Desktop(p) => p
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                        }
+                    );
+                }
+            }
+            let selection = ui::choose(&names)?;
+            drop(lock);
+            if let Some(index) = selection {
+                record(&entries[index]);
+                catalog::launch(&entries[index], &[])?;
+            }
+        }
+        Some(other) => return Err(format!("unknown command {other:?}, see jofi --help").into()),
     }
     Ok(())
 }
-
-fn print_results(results: &[SearchResult]) {
-    println!("{:<8} {:<34} {:<24} Reason", "Score", "Name", "ID");
-    println!("{:-<8} {:-<34} {:-<24} {:-<30}", "", "", "", "");
-    for result in results {
-        println!(
-            "{:<8} {:<34} {:<24} {}",
-            result.score,
-            truncate(&result.entry.name, 34),
-            truncate(&result.entry.id, 24),
-            truncate(&result.reason, 80),
-        );
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("jofi: {error}");
+        // Compositor hotkey launches have no visible stderr. Notify without a shell.
+        if env::args().len() == 1 {
+            let _ = std::process::Command::new("notify-send")
+                .args(["--app-name=jofi", "Jofi", &error.to_string()])
+                .status();
+        }
+        std::process::exit(1);
     }
-}
-
-fn print_profile_report(report: &ProfileReport) {
-    println!("entries: {}", report.entries);
-    println!(
-        "discovery: {:.3} ms",
-        report.discovery_ns as f64 / 1_000_000.0
-    );
-    println!(
-        "index_build: {:.3} ms",
-        report.index_build_ns as f64 / 1_000_000.0
-    );
-    println!(
-        "memory: rss={:?} KiB vm_size={:?} KiB",
-        report.memory.rss_kib, report.memory.vm_size_kib
-    );
-    if let Some(path) = &report.telemetry_log {
-        println!("telemetry_log: {}", path.display());
-    }
-    println!();
-    println!(
-        "{:<18} {:>12} {:>12} {:>12} {:>8} Best match",
-        "Query", "Avg ns", "Min ns", "Max ns", "Results"
-    );
-    println!(
-        "{:-<18} {:-<12} {:-<12} {:-<12} {:-<8} {:-<30}",
-        "", "", "", "", "", ""
-    );
-    for query in &report.search_reports {
-        println!(
-            "{:<18} {:>12.0} {:>12} {:>12} {:>8} {}",
-            truncate(&query.query, 18),
-            query.avg_ns,
-            query.min_ns,
-            query.max_ns,
-            query.result_count,
-            query.best_match.as_deref().unwrap_or("-"),
-        );
-    }
-}
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut out = s
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    out.push('…');
-    out
 }
