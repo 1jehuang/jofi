@@ -38,7 +38,17 @@ def trial(command):
     pending = b''
     attached = set()
     buffers = {}
+    parents = {}
+    subsurfaces = {}
+    synchronized = set()
+    waiting_parents = set()
     submitted = None
+    content_root = None
+    keyboard_enters = {}
+    def keyboard_event(line, now):
+        event = re.search(r'wl_keyboard[#@]\d+\.enter(?:, )?\(\d+,\s*wl_surface[#@](\d+)', line)
+        if event:
+            keyboard_enters[event.group(1)] = (now - start) / 1_000_000
     log = []
     try:
         while time.perf_counter_ns() - start < 5_000_000_000:
@@ -55,6 +65,15 @@ def trial(command):
                 line, pending = pending.split(b'\n', 1)
                 line = line.decode(errors='replace')
                 log.append(line)
+                keyboard_event(line, now)
+                child = re.search(r'\.get_subsurface\((?:new id )?wl_subsurface[#@](\d+),\s*wl_surface[#@](\d+),\s*wl_surface[#@](\d+)\)', line)
+                if child:
+                    subsurfaces[child.group(1)] = child.group(2)
+                    parents[child.group(2)] = child.group(3)
+                    synchronized.add(child.group(2))
+                desync = re.search(r'wl_subsurface[#@](\d+)\.set_desync', line)
+                if desync:
+                    synchronized.discard(subsurfaces.get(desync.group(1)))
                 buffer = re.search(r'\.create_buffer\((?:new id )?wl_buffer[#@](\d+),\s*\d+,\s*(\d+),\s*(\d+),', line)
                 if buffer:
                     buffers[buffer.group(1)] = (int(buffer.group(2)), int(buffer.group(3)))
@@ -63,21 +82,38 @@ def trial(command):
                 if match and min(buffers.get(match.group(2), (0, 0))) > 1:
                     attached.add(match.group(1))
                 match = re.search(r'-> wl_surface[#@](\d+)\.commit\(', line)
-                if match and match.group(1) in attached:
-                    submitted = (now - start) / 1_000_000
-                    break
+                if match:
+                    surface = match.group(1)
+                    if surface in waiting_parents:
+                        content_root = surface
+                        submitted = (now - start) / 1_000_000
+                        break
+                    if surface in attached:
+                        if surface in synchronized:
+                            waiting_parents.add(parents[surface])
+                        else:
+                            content_root = surface
+                            submitted = (now - start) / 1_000_000
+                            break
             if submitted is not None:
                 break
         if submitted is None:
             raise RuntimeError(f'No first-buffer commit for {command}:\n' + '\n'.join(log[-35:]))
+        while b'\n' in pending:
+            line, pending = pending.split(b'\n', 1)
+            keyboard_event(line.decode(errors='replace'), now)
         initial = memory(proc.pid)
         # Drain debug output while the compositor consumes the initial buffer.
         until = time.monotonic() + 0.1
         while time.monotonic() < until:
             if selector.select(0.01):
-                os.read(proc.stderr.fileno(), 65536)
+                pending += os.read(proc.stderr.fileno(), 65536)
+            now = time.perf_counter_ns()
+            while b'\n' in pending:
+                line, pending = pending.split(b'\n', 1)
+                keyboard_event(line.decode(errors='replace'), now)
         settled = memory(proc.pid)
-        return {'first_buffer_ms': submitted, 'initial_memory': initial, 'settled_memory': settled}
+        return {'first_buffer_ms': submitted, 'keyboard_and_content_ms': max(submitted, keyboard_enters[content_root]) if content_root in keyboard_enters else None, 'initial_memory': initial, 'settled_memory': settled}
     finally:
         selector.close()
         if proc.poll() is None:
@@ -96,6 +132,9 @@ def summarize(rows):
               'p95_ms': latency[max(0, __import__('math').ceil(len(latency) * .95) - 1)],
               'min_ms': min(latency), 'max_ms': max(latency),
               'mean_ms': statistics.mean(latency), 'stdev_ms': statistics.stdev(latency) if len(latency) > 1 else 0}
+    ready = [r['keyboard_and_content_ms'] for r in rows if r.get('keyboard_and_content_ms') is not None]
+    if ready:
+        result['median_keyboard_and_content_ms'] = statistics.median(ready)
     for key in ('VmRSS_kib', 'VmHWM_kib', 'Pss_kib'):
         values = [r['settled_memory'][key] for r in rows if key in r['settled_memory']]
         if values:
@@ -108,8 +147,12 @@ def main():
     parser.add_argument('--runs', type=int, default=30)
     parser.add_argument('--output', required=True)
     parser.add_argument('--warmup', type=int, default=3)
+    parser.add_argument('--jofi', default=str(Path.home() / '.local/bin/jofi'))
+    parser.add_argument('--baseline', help='Optional preserved previous jofi binary')
     args = parser.parse_args()
-    commands = {'jofi': [str(Path.home() / '.local/bin/jofi')], 'tofi-drun': ['/usr/bin/tofi-drun']}
+    commands = {'jofi': [args.jofi], 'tofi-drun': ['/usr/bin/tofi-drun']}
+    if args.baseline:
+        commands['jofi-before'] = [args.baseline]
     rows = {name: [] for name in commands}
     rng = random.Random(20261030)
     for round_number in range(args.warmup + args.runs):
@@ -120,7 +163,7 @@ def main():
             print(f'{round_number + 1}/{args.runs + args.warmup} {name}: {row["first_buffer_ms"]:.2f} ms', flush=True)
             if round_number >= args.warmup:
                 rows[name].append(row)
-    result = {'method': 'spawn to first content buffer (>1px in both dimensions) attachment followed by wl_surface commit, excludes tofi 1x1 background placeholder, WAYLAND_DEBUG=client, current session/theme, warm filesystem caches; memory 100ms after commit',
+    result = {'method': 'spawn to first content buffer (>1px in both dimensions) attachment followed by wl_surface commit, waits for synchronized subsurface parent commit, excludes 1x1 background placeholders, WAYLAND_DEBUG=client, current session/theme, warm filesystem caches; memory 100ms after commit',
               'commands': commands, 'warmup_per_app': args.warmup,
               'summary': {name: summarize(data) for name, data in rows.items()}, 'raw': rows}
     Path(args.output).write_text(json.dumps(result, indent=2) + '\n')

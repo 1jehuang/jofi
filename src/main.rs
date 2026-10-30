@@ -1,8 +1,10 @@
 mod catalog;
+mod font;
 mod scripts;
+mod startup;
 mod ui;
 
-use std::{env, fs, path::PathBuf};
+use std::{collections::HashMap, env, fs, path::PathBuf};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn usage() {
@@ -35,6 +37,44 @@ fn record(entry: &catalog::Entry) {
         let _ = fs::rename(temporary, path);
     }
 }
+fn prepare_names(entries: &mut [catalog::Entry], recent: &str) -> Vec<String> {
+    let mut ranks = HashMap::new();
+    for (rank, id) in recent.lines().enumerate() {
+        ranks.entry(id).or_insert(rank);
+    }
+    entries.sort_by_cached_key(|entry| {
+        ranks
+            .get(identity(entry).as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    let mut counts = HashMap::new();
+    for entry in entries.iter() {
+        *counts.entry(entry.name.as_str()).or_insert(0usize) += 1;
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            if counts[entry.name.as_str()] > 1 {
+                format!(
+                    "{} [{}]",
+                    entry.name,
+                    match &entry.target {
+                        catalog::Target::Rust(_) => "Rust".into(),
+                        catalog::Target::Desktop(path) => path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                    }
+                )
+            } else {
+                entry.name.clone()
+            }
+        })
+        .collect()
+}
+
 fn run() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -56,7 +96,35 @@ fn run() -> Result<()> {
         }
         _ => {}
     }
-    let mut entries = catalog::discover();
+    let gui = args.is_empty() || args.first().is_some_and(|arg| arg == "run");
+    let lock = if gui {
+        let runtime = env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .ok_or("XDG_RUNTIME_DIR is required for Wayland")?;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(runtime.join("jofi.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => Some(lock),
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let pending_font = gui.then(font::start);
+    let pending_entries = gui.then(|| {
+        std::thread::spawn(|| {
+            startup::mark("catalog discovery begin");
+            let entries = catalog::discover();
+            startup::mark("catalog discovered");
+            entries
+        })
+    });
+    let mut entries = if gui { Vec::new() } else { catalog::discover() };
     match args.first().map(String::as_str) {
         Some("list") => {
             for entry in entries {
@@ -109,44 +177,20 @@ fn run() -> Result<()> {
             catalog::launch(matches[0], &args[2..])?;
         }
         None | Some("run") => {
-            // An advisory lock lives only while the overlay is open. Crashes release it.
-            let runtime = env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .ok_or("XDG_RUNTIME_DIR is required for Wayland")?;
-            let lock = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(runtime.join("jofi.lock"))?;
-            if lock.try_lock().is_err() {
-                return Ok(());
-            }
+            // The advisory lock acquired above lives only while the overlay is open.
             let recent = fs::read_to_string(history_path()).unwrap_or_default();
-            entries.sort_by_cached_key(|e| {
-                recent
-                    .lines()
-                    .position(|line| line == identity(e))
-                    .unwrap_or(usize::MAX)
-            });
-            let mut names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
-            for (i, entry) in entries.iter().enumerate() {
-                if entries.iter().filter(|e| e.name == entry.name).count() > 1 {
-                    names[i] = format!(
-                        "{} [{}]",
-                        entry.name,
-                        match &entry.target {
-                            catalog::Target::Rust(_) => "Rust".into(),
-                            catalog::Target::Desktop(p) => p
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned(),
-                        }
-                    );
-                }
-            }
-            let selection = ui::choose(&names)?;
+            let selection = ui::choose(
+                || {
+                    entries = pending_entries
+                        .expect("GUI catalog worker started")
+                        .join()
+                        .map_err(|_| "catalog worker panicked")?;
+                    let names = prepare_names(&mut entries, &recent);
+                    startup::mark("menu prepared");
+                    Ok(names)
+                },
+                pending_font.expect("GUI font worker started"),
+            )?;
             drop(lock);
             if let Some(index) = selection {
                 record(&entries[index]);
@@ -158,6 +202,7 @@ fn run() -> Result<()> {
     Ok(())
 }
 fn main() {
+    startup::mark("entry");
     if let Err(error) = run() {
         eprintln!("jofi: {error}");
         // Compositor hotkey launches have no visible stderr. Notify without a shell.
@@ -167,5 +212,59 @@ fn main() {
                 .status();
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_preparation_preserves_recent_order_and_disambiguates() {
+        let mut entries = vec![
+            catalog::Entry {
+                name: "Alpha".into(),
+                target: catalog::Target::Desktop("/alpha.desktop".into()),
+            },
+            catalog::Entry {
+                name: "Browser".into(),
+                target: catalog::Target::Desktop("/browser.desktop".into()),
+            },
+            catalog::Entry {
+                name: "Browser".into(),
+                target: catalog::Target::Rust("/browser.rs".into()),
+            },
+            catalog::Entry {
+                name: "Zulu".into(),
+                target: catalog::Target::Desktop("/zulu.desktop".into()),
+            },
+        ];
+        let labels = prepare_names(&mut entries, "/browser.rs\n/alpha.desktop\n/browser.rs");
+        assert_eq!(
+            labels,
+            [
+                "Browser [Rust]",
+                "Alpha",
+                "Browser [browser.desktop]",
+                "Zulu"
+            ]
+        );
+        assert_eq!(identity(&entries[0]), "/browser.rs");
+        assert_eq!(identity(&entries[2]), "/browser.desktop");
+    }
+
+    #[test]
+    fn empty_history_retains_input_order() {
+        let mut entries = vec![
+            catalog::Entry {
+                name: "Alpha".into(),
+                target: catalog::Target::Rust("/alpha.rs".into()),
+            },
+            catalog::Entry {
+                name: "Zulu".into(),
+                target: catalog::Target::Rust("/zulu.rs".into()),
+            },
+        ];
+        assert_eq!(prepare_names(&mut entries, ""), ["Alpha", "Zulu"]);
     }
 }

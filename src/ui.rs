@@ -37,7 +37,7 @@ use wayland_protocols::wp::viewporter::client::{
 
 /// Show the launcher, returning the original input index, or None on cancellation.
 pub fn choose(
-    names: &[String],
+    prepare_names: impl FnOnce() -> Result<Vec<String>, Box<dyn Error>>,
     pending_font: crate::font::Pending,
 ) -> Result<Option<usize>, Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
@@ -68,6 +68,8 @@ pub fn choose(
     layer.commit();
     let pool = SlotPool::new(4096, &shm)?;
     conn.flush()?;
+    crate::startup::mark("Wayland initialized and layer configure requested");
+    let names = prepare_names()?;
     let font = pending_font.join().map_err(|_| "font loader panicked")??;
     let mut app = Launcher {
         loop_handle: event_loop.handle(),
@@ -82,7 +84,7 @@ pub fn choose(
         viewport,
         background_attached: false,
         font,
-        names: names.to_vec(),
+        names,
         query: String::new(),
         matches: Vec::new(),
         selected: 0,
@@ -449,7 +451,7 @@ impl Launcher {
             .set_destination(self.width as i32, self.height as i32);
         if !self.background_attached {
             let (background, pixel) = self.pool.create_buffer(1, 1, 4, wl_shm::Format::Argb8888)?;
-            pixel.copy_from_slice(&0xaa000000u32.to_ne_bytes());
+            pixel[..4].copy_from_slice(&0xaa000000u32.to_ne_bytes());
             background.attach_to(self.layer.wl_surface())?;
             self.background_attached = true;
         }
