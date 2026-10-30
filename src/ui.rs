@@ -117,8 +117,13 @@ struct Launcher {
     failure: Option<String>,
 }
 
-/// Case-insensitive Unicode subsequence match. Positions are character indices, never byte offsets.
+/// Subsequence matches always outrank typo fallbacks, retaining their original scoring.
 fn fuzzy(name: &str, query: &str) -> Option<(Vec<usize>, i64)> {
+    subsequence(name, query).or_else(|| typo_match(name, query))
+}
+
+/// Case-insensitive Unicode subsequence match. Positions are character indices, never byte offsets.
+fn subsequence(name: &str, query: &str) -> Option<(Vec<usize>, i64)> {
     let hay: Vec<char> = name.chars().collect();
     let needle: Vec<char> = query.chars().collect();
     let mut positions = Vec::new();
@@ -137,6 +142,97 @@ fn fuzzy(name: &str, query: &str) -> Option<(Vec<usize>, i64)> {
         next = found + 1;
     }
     Some((positions, score))
+}
+
+/// A conservative word-level edit fallback, including adjacent transpositions.
+/// Short queries remain subsequence-only to avoid flooding the result list.
+fn typo_match(name: &str, query: &str) -> Option<(Vec<usize>, i64)> {
+    let needle: Vec<char> = query
+        .chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    if needle.len() < 4 {
+        return None;
+    }
+    let limit = if needle.len() >= 8 { 2 } else { 1 };
+    let chars: Vec<char> = name.chars().collect();
+    let mut ranges = vec![(0, chars.len())];
+    let mut start = 0;
+    for end in 0..=chars.len() {
+        if end == chars.len() || !chars[end].is_alphanumeric() {
+            if start < end {
+                ranges.push((start, end));
+            }
+            start = end + 1;
+        }
+    }
+    ranges
+        .into_iter()
+        .filter_map(|(start, end)| {
+            if (end - start).abs_diff(needle.len()) > limit {
+                return None;
+            }
+            let word: Vec<char> = chars[start..end]
+                .iter()
+                .map(|c| c.to_lowercase().next().unwrap_or(*c))
+                .collect();
+            let distance = edit_distance(&word, &needle);
+            if distance > limit {
+                return None;
+            }
+            let positions = (start..end)
+                .filter(|&i| needle.contains(&chars[i].to_lowercase().next().unwrap_or(chars[i])))
+                .collect();
+            Some((
+                positions,
+                i64::MAX / 2 + distance as i64 * 100 + start as i64,
+            ))
+        })
+        .min_by_key(|entry| entry.1)
+}
+
+fn edit_distance(left: &[char], right: &[char]) -> usize {
+    let mut previous_previous = Vec::new();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.iter().enumerate() {
+        let mut row = vec![i + 1; right.len() + 1];
+        for (j, b) in right.iter().enumerate() {
+            row[j + 1] = (previous[j + 1] + 1)
+                .min(row[j] + 1)
+                .min(previous[j] + usize::from(a != b));
+            if i > 0 && j > 0 && *a == right[j - 1] && left[i - 1] == *b {
+                row[j + 1] = row[j + 1].min(previous_previous[j - 1] + 1);
+            }
+        }
+        previous_previous = previous;
+        previous = row;
+    }
+    previous[right.len()]
+}
+
+fn paint_caret(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    thickness: u32,
+    caret_height: u32,
+) {
+    let left = i64::from(x).max(0).min(i64::from(width));
+    let right = (i64::from(x) + i64::from(thickness))
+        .max(0)
+        .min(i64::from(width));
+    let top = i64::from(y).max(0).min(i64::from(height));
+    let bottom = (i64::from(y) + i64::from(caret_height))
+        .max(0)
+        .min(i64::from(height));
+    for py in top..bottom {
+        for px in left..right {
+            let offset = (py as usize * width as usize + px as usize) * 4;
+            canvas[offset..offset + 4].copy_from_slice(&0xffff4500u32.to_ne_bytes());
+        }
+    }
 }
 
 impl Launcher {
@@ -232,7 +328,6 @@ impl Launcher {
         let x = (width as f32 * 0.35) as i32;
         let y = (height as f32 * 0.35) as i32;
         let line = (font_size + 25.0 * scale as f32) as i32;
-        let input = format!("> {}_", self.query);
         paint_text(
             canvas,
             width,
@@ -241,9 +336,24 @@ impl Launcher {
             font_size,
             x,
             y,
-            &input,
+            &self.query,
             0xffffff,
             &[],
+        );
+        let scaled = self.font.as_scaled(PxScale::from(font_size));
+        let advance: f32 = self
+            .query
+            .chars()
+            .map(|ch| scaled.h_advance(scaled.glyph_id(ch)))
+            .sum();
+        paint_caret(
+            canvas,
+            width,
+            height,
+            x.saturating_add(advance.round() as i32),
+            y,
+            3 * scale,
+            font_size.ceil() as u32,
         );
         if self.matches.is_empty() {
             paint_text(
@@ -522,7 +632,55 @@ delegate_registry!(Launcher);
 
 #[cfg(test)]
 mod tests {
-    use super::fuzzy;
+    use super::{fuzzy, paint_caret, subsequence};
+    #[test]
+    fn transposed_typo_matches_app_and_word() {
+        assert_eq!(fuzzy("Chrome", "chrmoe").unwrap().0, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            fuzzy("Google Chrome", "chrmoe").unwrap().0,
+            vec![7, 8, 9, 10, 11, 12]
+        );
+        assert!(fuzzy("Chrome", "zzzzzz").is_none());
+        assert!(fuzzy("Chrome", "crm").is_some());
+        assert!(fuzzy("Chrome", "xro").is_none());
+    }
+    #[test]
+    fn subsequence_rank_is_preserved_and_beats_typos() {
+        for (name, query) in [
+            ("Chrome", "chrm"),
+            ("Firefox", "ffx"),
+            ("Terminal", "term"),
+            ("Éclair 🦀 Rust", "é🦀r"),
+        ] {
+            assert_eq!(fuzzy(name, query), subsequence(name, query));
+        }
+        assert!(
+            fuzzy("chrmoe subsequence", "chrmoe").unwrap().1 < fuzzy("Chrome", "chrmoe").unwrap().1
+        );
+    }
+    #[test]
+    fn typo_unicode_positions_remain_character_indices() {
+        assert_eq!(
+            fuzzy("🦀 Éclair", "écliar").unwrap().0,
+            vec![2, 3, 4, 5, 6, 7]
+        );
+    }
+    #[test]
+    fn caret_is_three_pixels_wide_and_clips_safely() {
+        let mut pixels = vec![0; 8 * 6 * 4];
+        paint_caret(&mut pixels, 8, 6, 2, 1, 3, 4);
+        let count = pixels
+            .chunks_exact(4)
+            .filter(|p| u32::from_ne_bytes((*p).try_into().unwrap()) == 0xffff4500)
+            .count();
+        assert_eq!(count, 12);
+        assert_eq!(
+            u32::from_ne_bytes(pixels[40..44].try_into().unwrap()),
+            0xffff4500
+        );
+        paint_caret(&mut pixels, 8, 6, -2, -1, 3, 2);
+        paint_caret(&mut pixels, 8, 6, i32::MAX, i32::MAX, 3, 24);
+    }
     #[test]
     fn unicode_positions_are_characters() {
         assert_eq!(fuzzy("Éclair 🦀 Rust", "é🦀r").unwrap().0, vec![0, 7, 9]);
