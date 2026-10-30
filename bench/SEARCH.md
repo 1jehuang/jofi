@@ -81,3 +81,44 @@ In this run indexed filtering was lower-latency for every recorded workload and 
 `src/search_tests.rs` contains 15 executable tests covering exact/prefix ranking, initials/camel case, unordered AND tokens including mixed fuzzy/typo terms, literal punctuation, Unicode case/accent/decomposed highlights, distinct complex emoji, Cyrillic/Japanese matching, four edit types and partial prefixes, short-query noise, strong-literal-fuzzy-over-typo priority, Google Chrome typo correction over weak Chromium scatter, long word/camel-boundary acronym protection, repeated words, stable original recent/history tie order, and empty input. Helpers validate original indices, sorted unique character-index highlights, and ascending score/index ordering.
 
 The edit-distance oracle uses an independent unbanded full matrix. It compares all 127 binary strings of lengths zero through six against all 127 targets, at budgets two, zero, and one: **48,387 comparisons**, reusing one implementation scratch buffer throughout to exercise growth, shrinkage, early exits, and transpositions. An earlier 12-test corpus passed hosted receipt `20261030-021537276-758629`. Final integrated validation, including complex-emoji/non-Latin handling, optimized DP guards, and the Chrome/Chromium weak-scatter regression, passed on hosted: `justrust check` receipt `20261030-023447556-937025`, `justrust test` receipt `20261030-023448353-937177` (33 passed, zero failed, one ignored), and `justrust clippy --all-targets -- -D warnings` receipt `20261030-023449265-937346`. The launcher uses this same SearchIndex API for live filtering.
+
+## Real installed-launcher workflow acceptance
+
+Run the actual launcher against real niri, in a completely private offscreen
+Xvfb display, with real XTest keyboard events and fixture-only desktop entries:
+
+```sh
+python3 bench/search-workflow.py --jofi ~/.local/bin/jofi
+```
+
+Requires installed `Xvfb`, `xdotool`, `niri`, and `gio`. The harness creates a
+private Xauthority cookie, disables X11 TCP listening, and uses private runtime,
+Wayland/IPC sockets, config, data, scripts, history and cache directories. Nested
+niri is never started with `--session`. No key is sent to the user's active
+desktop, no real app is launched, and no compositor config is changed. Fixture
+entries invoke only a Python marker through actual `gio launch`, so the test
+checks the real keyboard, filtering, selection, desktop identity, execution and
+history paths rather than a mocked launcher callback. Only owned child PIDs are
+stopped. Raw protocol logs and results stay in the scratch artifact directory.
+
+The first real interactive run exposed an important ranking defect: `chrmoe`
+selected Chromium Browser instead of Google Chrome because any subsequence had
+previously outranked every typo correction. The revised weak-scatter tier fixes
+that case while preserving strong literal matches and boundary acronyms.
+
+All **13 cases passed** against both the built release and the atomically
+installed executable on October 30, 2026: transposed typo, unordered mixed
+fuzzy/typo terms, two substitutions, abbreviation, accent normalization,
+Backspace repair, Down selection, Up wrapping, Tab, Shift+Tab, empty-query
+recency, Enter with no results followed by Ctrl+U recovery, and literal
+punctuation followed by Escape cancellation. Selections were checked against
+fixture launch markers and saved desktop-file history identities. The installed
+executable's SHA256 matched the validated release:
+
+`49f83d2e4f04ac98b29b244dcf90fa4d03c62a1b115e8a76ef219cf3c9334941`
+
+Installed-path acceptance artifacts:
+`~/.jcode/scratch/jofi-search-workflow-t0qytyfj/results.json`.
+The previous installed binary was preserved at
+`~/.jcode/scratch/jofi-before-search-correction-20261030-0937`.
+These functional checks are separate from the filter microbenchmarks above.

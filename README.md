@@ -107,6 +107,15 @@ Recent launches are promoted on the next opening and
 stored in `$XDG_STATE_HOME/jofi/recent`. An advisory runtime lock prevents duplicate
 overlays. There is no telemetry or persistent background process.
 
+Search uses an indexed optimal fuzzy matcher with word/camel-case bonuses,
+case/accent normalization, and whitespace-separated terms in any order.
+Punctuation is literal. Word-prefix typo recovery allows one edit from four
+characters and two from eight, including adjacent transpositions. Strong fuzzy
+matches stay first, but a good typo correction beats a weak scattered match:
+`chrmoe` finds Google Chrome before Chromium Browser. Short queries stay strict
+to limit noise. Ranking, filtering benchmarks, and isolated keyboard-to-launch
+acceptance are documented in `bench/SEARCH.md`.
+
 ## Startup design
 
 The fullscreen dim background is a single stretched pixel. Only the small text
