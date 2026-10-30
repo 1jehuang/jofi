@@ -31,7 +31,7 @@ pub fn cache_dir() -> PathBuf {
     home_dir("XDG_CACHE_HOME", ".cache").join("jofi")
 }
 
-fn fields(text: &str) -> BTreeMap<String, String> {
+fn fields(text: &str) -> BTreeMap<&str, &str> {
     let mut result = BTreeMap::new();
     let mut active = false;
     for line in text.lines().map(str::trim) {
@@ -41,7 +41,22 @@ fn fields(text: &str) -> BTreeMap<String, String> {
         }
         if active && !line.starts_with('#') {
             if let Some((key, value)) = line.split_once('=') {
-                result.insert(key.trim().into(), value.trim().into());
+                let key = key.trim();
+                if matches!(
+                    key,
+                    "Type"
+                        | "Name"
+                        | "Hidden"
+                        | "NoDisplay"
+                        | "TryExec"
+                        | "OnlyShowIn"
+                        | "NotShowIn"
+                        | "Exec"
+                        | "DBusActivatable"
+                ) || key.starts_with("Name[")
+                {
+                    result.insert(key, value.trim());
+                }
             }
         }
     }
@@ -78,23 +93,26 @@ fn executable(name: &str) -> bool {
         env::split_paths(&env::var_os("PATH").unwrap_or_default()).any(|p| valid(&p.join(name)))
     }
 }
-fn display_name(map: &BTreeMap<String, String>) -> Option<String> {
+fn name_keys() -> [String; 2] {
     let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
         .find_map(|k| env::var(k).ok().filter(|v| !v.is_empty()))
         .unwrap_or_default();
     let locale = locale.split('.').next().unwrap_or("");
     let language = locale.split('_').next().unwrap_or("");
-    map.get(&format!("Name[{locale}]"))
-        .or_else(|| map.get(&format!("Name[{language}]")))
+    [format!("Name[{locale}]"), format!("Name[{language}]")]
+}
+fn display_name(map: &BTreeMap<&str, &str>, keys: &[String; 2]) -> Option<String> {
+    map.get(keys[0].as_str())
+        .or_else(|| map.get(keys[1].as_str()))
         .or_else(|| map.get("Name"))
         .map(|s| unescape(s))
 }
-fn visible(map: &BTreeMap<String, String>, desktops: &[&str]) -> bool {
-    if map.get("Type").map(String::as_str) != Some("Application")
+fn visible(map: &BTreeMap<&str, &str>, desktops: &[&str]) -> bool {
+    if map.get("Type").copied() != Some("Application")
         || ["Hidden", "NoDisplay"]
             .iter()
-            .any(|k| map.get(*k).is_some_and(|v| v == "true"))
+            .any(|k| map.get(*k).is_some_and(|v| *v == "true"))
     {
         return false;
     }
@@ -116,7 +134,7 @@ fn visible(map: &BTreeMap<String, String>, desktops: &[&str]) -> bool {
     {
         return false;
     }
-    map.contains_key("Exec") || map.get("DBusActivatable").is_some_and(|v| v == "true")
+    map.contains_key("Exec") || map.get("DBusActivatable").is_some_and(|v| *v == "true")
 }
 fn desktop_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -141,6 +159,7 @@ fn desktop_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
 pub fn discover_from(roots: &[PathBuf], scripts: &Path, desktops: &[&str]) -> Vec<Entry> {
     let mut result = Vec::new();
     let mut seen = HashSet::new();
+    let keys = name_keys();
     for root in roots {
         let mut files = Vec::new();
         desktop_files(root, root, &mut files);
@@ -153,8 +172,8 @@ pub fn discover_from(roots: &[PathBuf], scripts: &Path, desktops: &[&str]) -> Ve
             };
             let map = fields(&text);
             if visible(&map, desktops) {
-                if let Some(name) =
-                    display_name(&map).filter(|s| !s.trim().is_empty() && !s.contains(['\n', '\r']))
+                if let Some(name) = display_name(&map, &keys)
+                    .filter(|s| !s.trim().is_empty() && !s.contains(['\n', '\r']))
                 {
                     result.push(Entry {
                         name,
@@ -229,7 +248,19 @@ mod tests {
     #[test]
     fn desktop_group_only() {
         let m = fields("[Desktop Entry]\nName=Hello\\sWorld\nType=Application\nExec=hello\n[Desktop Action foo]\nName=Wrong\n");
-        assert_eq!(display_name(&m).unwrap(), "Hello World");
+        assert_eq!(display_name(&m, &name_keys()).unwrap(), "Hello World");
+        assert!(visible(&m, &[]));
+    }
+    #[test]
+    fn borrowed_fields_keep_localization_and_skip_unused_metadata() {
+        let m = fields("[Desktop Entry]\nType=Application\nName=Base\nName[fr]=Français\nExec=app --profile work\nComment=unused\nIcon=unused\n");
+        assert_eq!(
+            display_name(&m, &["Name[fr_FR]".into(), "Name[fr]".into()]).unwrap(),
+            "Français"
+        );
+        assert_eq!(m.get("Exec"), Some(&"app --profile work"));
+        assert!(!m.contains_key("Comment"));
+        assert!(!m.contains_key("Icon"));
         assert!(visible(&m, &[]));
     }
     #[test]
@@ -241,9 +272,8 @@ mod tests {
             "NotShowIn=niri;",
             "TryExec=/nonexistent/jofi-test",
         ] {
-            let m = fields(&format!(
-                "[Desktop Entry]\nType=Application\nExec=foo\n{key}"
-            ));
+            let text = format!("[Desktop Entry]\nType=Application\nExec=foo\n{key}");
+            let m = fields(&text);
             assert!(!visible(&m, &["niri"]), "{key}");
         }
     }

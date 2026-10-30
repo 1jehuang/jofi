@@ -11,3 +11,8 @@ roxmltree = "0.21"
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
