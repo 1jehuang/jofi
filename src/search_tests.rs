@@ -1,5 +1,64 @@
 //! Independent behavioral corpus for the indexed search API.
+// A harness=false benchmark includes search.rs with cfg(test) but does not run
+// unit tests. Keep those helper-only dead-code warnings out of strict bench lint.
+#![allow(dead_code)]
 use super::SearchIndex;
+
+// Deliberately unbanded, allocation-heavy full matrix reference. This oracle
+// shares no scratch rows, pruning, or recurrence storage with the implementation.
+fn reference_prefix(query: &[char], target: &[char], limit: usize) -> Option<(usize, usize)> {
+    let mut matrix = vec![vec![0usize; target.len() + 1]; query.len() + 1];
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in matrix[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=query.len() {
+        for j in 1..=target.len() {
+            matrix[i][j] = (matrix[i - 1][j] + 1)
+                .min(matrix[i][j - 1] + 1)
+                .min(matrix[i - 1][j - 1] + usize::from(query[i - 1] != target[j - 1]));
+            if i > 1 && j > 1 && query[i - 1] == target[j - 2] && query[i - 2] == target[j - 1] {
+                matrix[i][j] = matrix[i][j].min(matrix[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    (0..=target.len())
+        .filter_map(|j| {
+            let distance = matrix[query.len()][j];
+            (distance <= limit).then_some((distance, j))
+        })
+        .min_by_key(|&(distance, consumed)| (distance, std::cmp::Reverse(consumed)))
+}
+
+#[test]
+fn exhaustive_banded_prefix_matches_full_matrix_and_scratch_reuse() {
+    let mut words = Vec::new();
+    for len in 0..=6 {
+        for bits in 0..(1usize << len) {
+            words.push(
+                (0..len)
+                    .map(|i| if bits & (1 << i) == 0 { 'a' } else { 'b' })
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    let mut scratch = super::EditScratch::default();
+    for query in &words {
+        // Reverse targets and edit budgets repeatedly grow/shrink the recycled
+        // rows and follow early-exit failures with successful transpositions.
+        for target in words.iter().rev() {
+            for budget in [2, 0, 1] {
+                assert_eq!(
+                    scratch.prefix_distance(query, target, budget),
+                    reference_prefix(query, target, budget),
+                    "query={query:?} target={target:?} budget={budget}"
+                );
+            }
+        }
+    }
+}
 
 fn names(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_owned()).collect()
@@ -87,6 +146,16 @@ fn unicode_case_accents_and_original_highlights() {
     let r = hits(&["🦀 Cafe\u{301} Tools"], "cafe");
     assert!(r[0].1.contains(&3));
     assert!(r[0].1.iter().all(|&i| (2..=6).contains(&i)));
+}
+
+#[test]
+fn complex_emoji_and_non_latin_names_remain_distinct() {
+    includes("👩‍💻 Developer Tools", "👩‍💻");
+    excludes("👩‍🔬 Science Tools", "👩‍💻");
+    includes("ЦИФРЫ", "циф");
+    includes("日本語入力", "日入");
+    let r = hits(&["🦀 👩‍💻 Developer Tools"], "👩‍💻");
+    assert_eq!(r[0].1, vec![2, 3, 4]);
 }
 #[test]
 fn conservative_typo_edit_budget_and_prefixes() {

@@ -88,6 +88,16 @@ fn run(label: &str, names: &[String], batches: usize, repeats: usize) {
         build.0,
         build.1
     );
+    let mut first_keys = Vec::with_capacity(batches);
+    for _ in 0..batches {
+        let mut fresh = SearchIndex::new(names);
+        let start = Instant::now();
+        black_box(fresh.filter(black_box("c")));
+        first_keys.push(start.elapsed().as_secs_f64() * 1e6);
+    }
+    let first_p50 = percentile(&mut first_keys, 0.50);
+    let first_p95 = percentile(&mut first_keys, 0.95);
+    println!("  first nonempty key p50 {first_p50:.1} us p95 {first_p95:.1} us (fresh index, lazy matcher included)");
     let groups: &[(&str, &[&str])] = &[
         (
             "prefix typing",
@@ -155,6 +165,27 @@ fn run(label: &str, names: &[String], batches: usize, repeats: usize) {
             old.1 / count,
             new.0 / count,
             new.1 / count
+        );
+    }
+    println!("  Individual-key latency (101 samples, no batch averaging):");
+    for query in ["term", "chrmoe", "zzzzzz"] {
+        let old = measure(
+            || {
+                black_box(baseline(black_box(names), black_box(query)));
+            },
+            101,
+            1,
+        );
+        let new = measure(
+            || {
+                black_box(index.filter(black_box(query)));
+            },
+            101,
+            1,
+        );
+        println!(
+            "    {query:8} baseline {:9.1}/{:9.1} us | indexed {:9.1}/{:9.1} us (p50/p95)",
+            old.0, old.1, new.0, new.1
         );
     }
 }
