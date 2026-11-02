@@ -203,7 +203,12 @@ impl SearchIndex {
                     // c-h-r-m-o-e across "Chromium Browser". Strong literals,
                     // compact abbreviations and boundary initials still win.
                     let correction = if weak {
-                        typo_prefix(entry, &term.folded, &mut self.edit)
+                        typo_term(
+                            entry,
+                            &term.folded,
+                            &mut self.edit,
+                            terms.iter().any(|term| term.folded.len() >= 4),
+                        )
                     } else {
                         None
                     };
@@ -219,7 +224,12 @@ impl SearchIndex {
                             &mut positions,
                         );
                     }
-                } else if let Some(hit) = typo_prefix(entry, &term.folded, &mut self.edit) {
+                } else if let Some(hit) = typo_term(
+                    entry,
+                    &term.folded,
+                    &mut self.edit,
+                    terms.iter().any(|term| term.folded.len() >= 4),
+                ) {
                     errors += hit.distance;
                     score += hit.completion as i64 * 1024 + hit.start as i64;
                     entry.append_positions(hit.start..hit.end, &mut positions);
@@ -287,6 +297,50 @@ struct TypoHit {
     distance: usize,
     completion: usize,
 }
+fn typo_term(
+    entry: &Prepared,
+    query: &[char],
+    scratch: &mut EditScratch,
+    contextual: bool,
+) -> Option<TypoHit> {
+    if let Some(hit) = typo_prefix(entry, query, scratch) {
+        return Some(hit);
+    }
+    // Allow a second edit at six letters only with evidence of a transposition.
+    if query.len() == 6 && query.iter().all(|ch| ch.is_alphanumeric()) {
+        let mut swapped = query.to_vec();
+        for i in 0..query.len() - 1 {
+            if query[i] == query[i + 1] {
+                continue;
+            }
+            swapped.swap(i, i + 1);
+            if let Some(mut hit) = typo_prefix(entry, &swapped, scratch) {
+                hit.distance += 1;
+                return Some(hit);
+            }
+            swapped.swap(i, i + 1);
+        }
+    }
+    // Short fragments may recover inside words only with other query context.
+    if contextual && query.len() == 3 && query.iter().all(|ch| ch.is_alphanumeric()) {
+        for word in &entry.words {
+            for start in word.clone() {
+                if let Some((distance, consumed)) =
+                    scratch.prefix_distance(query, &entry.folded[start..word.end], 1)
+                {
+                    return Some(TypoHit {
+                        start,
+                        end: start + consumed,
+                        distance,
+                        completion: word.end - start - consumed,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 fn typo_prefix(entry: &Prepared, query: &[char], scratch: &mut EditScratch) -> Option<TypoHit> {
     // Keep short abbreviation queries precise. Seven characters provide enough
     // evidence for two mistakes (vekstpo -> Vesktop, fireofv -> Firefox), while

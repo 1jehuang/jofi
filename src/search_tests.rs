@@ -338,3 +338,36 @@ fn empty_catalog_and_query_are_safe() {
         vec![0, 1]
     );
 }
+
+#[test]
+fn screenshot_fragment_and_double_transposition_recovery() {
+    let catalog = [
+        "Screenshot Output",
+        "Screenshot Window",
+        "Window Settings",
+        "Firefox",
+    ];
+    for query in [
+        "creens tho widnwo",
+        "widnwo tho creens",
+        "creens tho window",
+    ] {
+        let result = hits(&catalog, query);
+        assert_eq!(
+            result.first().map(|hit| hit.0),
+            Some(1),
+            "{query}: {result:?}"
+        );
+    }
+    includes("Window", "widnwo");
+    excludes("Chrome", "cxrxme");
+    excludes("Screenshot", "tho");
+    excludes("Screenshot", "tho xxx");
+    excludes("Screenshot Window", "creens tho zzzzzz");
+    excludes("Screenshot Window", "creens t++ widnwo");
+    let result = hits(
+        &["Screenshot Window", "creens tho widnwo"],
+        "creens tho widnwo",
+    );
+    assert_eq!(result[0].0, 1);
+}

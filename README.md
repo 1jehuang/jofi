@@ -185,7 +185,11 @@ characters and two from seven, including adjacent transpositions. Strong fuzzy
 matches stay first, but a good typo correction beats a weak scattered match:
 `chrmoe` finds Google Chrome before Chromium Browser. Short queries stay strict
 to limit noise. Two-error examples `vekstpo` and `fireofv x` find Vesktop and
-Firefox respectively. Ranking, filtering benchmarks, and isolated keyboard-to-launch
+Firefox respectively. Six-letter terms also allow a second edit when one is an
+adjacent transposition (`widnwo` finds Window). Three-letter fragments can recover
+one typo inside a word only when accompanied by a term of at least four letters.
+For example, `creens tho widnwo` finds Screenshot Window. Standalone short queries
+remain strict. Ranking, filtering benchmarks, and isolated keyboard-to-launch
 acceptance are documented in `bench/SEARCH.md`.
 
 ## Startup design
