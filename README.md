@@ -189,7 +189,12 @@ Firefox respectively. Six-letter terms also allow a second edit when one is an
 adjacent transposition (`widnwo` finds Window). Three-letter fragments can recover
 one typo inside a word only when accompanied by a term of at least four letters.
 For example, `creens tho widnwo` finds Screenshot Window. Standalone short queries
-remain strict. Ranking, filtering benchmarks, and isolated keyboard-to-launch
+remain strict. Recovery also combines skipped letters with bounded edits inside
+a word, so `scrne wndoiw` finds Screenshot Window. This fallback uses the same
+one-edit (four to six letters) / two-edit (seven or more) budgets, and considers
+only words at most twice the term length to limit accidental matches. Corrected
+spans are highlighted, including any skipped letters within the span.
+Ranking, filtering benchmarks, and isolated keyboard-to-launch
 acceptance are documented in `bench/SEARCH.md`.
 
 ## Startup design

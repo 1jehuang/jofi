@@ -1,4 +1,4 @@
-//! Indexed launcher search: optimal fuzzy alignment plus bounded word-prefix typos.
+//! Indexed launcher search: optimal fuzzy alignment plus bounded typo recovery.
 //!
 //! Nucleo supplies fzf-style boundary/consecutive/camel-case scoring. Its low-level
 //! API is deliberately used instead of the query language: punctuation is literal.
@@ -170,7 +170,8 @@ impl SearchIndex {
     /// literal, not an undocumented fzf operator language.
     /// Terms match independently, so their highlighted positions may overlap.
     /// Alphanumeric word-prefix typos allow one edit at 4..=6 characters and
-    /// two at 7 or more. Shorter terms use literal fuzzy matching only.
+    /// two at 7 or more. Recovery also combines word-local skips with edits.
+    /// Three-letter typo fragments require a longer accompanying term.
     pub fn filter(&mut self, query: &str) -> Vec<SearchMatch> {
         let terms: Vec<_> = query.split_whitespace().map(Prepared::query).collect();
         if terms.is_empty() {
@@ -184,6 +185,7 @@ impl SearchIndex {
         let mut matches = Vec::with_capacity(self.entries.len());
         // Compare a single whole-name query without whitespace syntax tricks.
         let whole = Prepared::new(query.trim());
+        let contextual = terms.iter().any(|term| term.folded.len() >= 4);
         for (index, entry) in self.entries.iter().enumerate() {
             let mut positions = Vec::new();
             let mut score = 0i64;
@@ -203,12 +205,7 @@ impl SearchIndex {
                     // c-h-r-m-o-e across "Chromium Browser". Strong literals,
                     // compact abbreviations and boundary initials still win.
                     let correction = if weak {
-                        typo_term(
-                            entry,
-                            &term.folded,
-                            &mut self.edit,
-                            terms.iter().any(|term| term.folded.len() >= 4),
-                        )
+                        typo_term(entry, &term.folded, &mut self.edit, contextual)
                     } else {
                         None
                     };
@@ -224,12 +221,8 @@ impl SearchIndex {
                             &mut positions,
                         );
                     }
-                } else if let Some(hit) = typo_term(
-                    entry,
-                    &term.folded,
-                    &mut self.edit,
-                    terms.iter().any(|term| term.folded.len() >= 4),
-                ) {
+                } else if let Some(hit) = typo_term(entry, &term.folded, &mut self.edit, contextual)
+                {
                     errors += hit.distance;
                     score += hit.completion as i64 * 1024 + hit.start as i64;
                     entry.append_positions(hit.start..hit.end, &mut positions);
@@ -321,6 +314,35 @@ fn typo_term(
             swapped.swap(i, i + 1);
         }
     }
+    // Unlike prefix edit distance, this permits omitted candidate letters and
+    // typing mistakes together. Keep recovery inside one reasonably dense word
+    // so incidental letters scattered through a long label do not become hits.
+    if query.len() >= 4 && query.iter().all(|ch| ch.is_alphanumeric()) {
+        let limit = if query.len() >= 7 { 2 } else { 1 };
+        let mut best = None;
+        for word in &entry.words {
+            if word.len() > query.len().saturating_mul(2) {
+                continue;
+            }
+            if let Some((distance, consumed)) =
+                scratch.subsequence_distance(query, &entry.folded[word.clone()], limit)
+            {
+                let hit = TypoHit {
+                    start: word.start,
+                    end: word.start + consumed,
+                    distance,
+                    completion: word.len() - consumed,
+                };
+                let key = |h: TypoHit| (h.distance, h.end - h.start, h.start);
+                if best.is_none_or(|previous| key(hit) < key(previous)) {
+                    best = Some(hit);
+                }
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
     // Short fragments may recover inside words only with other query context.
     if contextual && query.len() == 3 && query.iter().all(|ch| ch.is_alphanumeric()) {
         for word in &entry.words {
@@ -385,6 +407,46 @@ struct EditScratch {
     rows: [Vec<usize>; 3],
 }
 impl EditScratch {
+    /// O(query * word) time and three recycled rows. Skipping target letters is
+    /// free, while extra/wrong query letters and adjacent swaps cost one edit.
+    /// This must not use the prefix algorithm's diagonal band or early exit:
+    /// free target skips can move a valid alignment arbitrarily off diagonal.
+    fn subsequence_distance(
+        &mut self,
+        query: &[char],
+        target: &[char],
+        limit: usize,
+    ) -> Option<(usize, usize)> {
+        let outside = limit + 1;
+        for row in &mut self.rows {
+            row.resize(target.len() + 1, outside);
+            row.fill(outside);
+        }
+        self.rows[0].fill(0);
+        for i in 1..=query.len() {
+            let row = i % 3;
+            let prev = (i + 2) % 3;
+            let prev_prev = (i + 1) % 3;
+            self.rows[row][0] = i.min(outside);
+            for j in 1..=target.len() {
+                let mut distance = self.rows[row][j - 1]
+                    .min(self.rows[prev][j] + 1)
+                    .min(self.rows[prev][j - 1] + usize::from(query[i - 1] != target[j - 1]));
+                if i > 1 && j > 1 && query[i - 1] == target[j - 2] && query[i - 2] == target[j - 1]
+                {
+                    distance = distance.min(self.rows[prev_prev][j - 2] + 1);
+                }
+                self.rows[row][j] = distance.min(outside);
+            }
+        }
+        self.rows[query.len() % 3]
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(consumed, &distance)| (distance <= limit).then_some((distance, consumed)))
+            .min()
+    }
+
     fn prefix_distance(
         &mut self,
         query: &[char],

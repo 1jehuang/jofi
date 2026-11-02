@@ -227,3 +227,31 @@ Hosted check `20261030-032559395-1358110`, full tests
 `20261030-032602432-1358293`, and explicit hosted release
 `20261030-032603566-1358688` all passed. Installed binary SHA256:
 `3bf8d0986bfc327e980a0c03d1f01ca663f10eb1c58a6769821c206b5ed09d89`.
+# Mixed abbreviation and typo recovery (2026-11-01)
+
+Search now has a word-local subsequence edit fallback after prefix recovery.
+Target skips are free, query deletions/substitutions and adjacent target swaps
+cost one edit. Terms of four to six letters have one edit, seven or more have
+two. Candidate words must be at most twice the term length. Existing short-term
+context rules and six-letter transposition recovery remain in place.
+Strong Nucleo alignments retain priority. Corrected spans include skipped letters
+in the highlight. `scrne wndoiw` and `creens tho widnwo` are regression-tested,
+including the installed `Screenshot (Window)` label and negative/ranking cases.
+An exhaustive two-character-alphabet corpus checks recycled subsequence rows
+against a full matrix and interleaves prefix recovery to check scratch reuse.
+
+Release benchmark on the local 133-entry app catalog, 101 samples per key:
+
+| Query | p50 | p95 |
+| --- | ---: | ---: |
+| `scrne wndoiw` | 33.4 us | 35.3 us |
+| `creens tho widnwo` | 64.7 us | 68.5 us |
+| `chrmoe` | 69.8 us | 78.8 us |
+
+These are full filtering/sorting/highlight timings, not GUI end-to-end latency
+or a speedup claim against the previous revision. The benchmark's printed
+baseline remains the much older copied matcher, not the previous revision.
+Group workloads used three batches and one repetition, so treat those as a
+smoke measurement rather than robust tail-latency evidence. Synthetic 10k-entry
+catalog p50/p95 was 3.57/3.73 ms for `scrne wndoiw` and 6.72/6.92 ms for
+`creens tho widnwo`. 55 tests passed and strict all-target Clippy passed.

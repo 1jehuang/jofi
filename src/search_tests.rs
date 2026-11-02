@@ -371,3 +371,95 @@ fn screenshot_fragment_and_double_transposition_recovery() {
     );
     assert_eq!(result[0].0, 1);
 }
+
+#[test]
+fn abbreviations_can_contain_typos() {
+    let catalog = [
+        "Screen Settings",
+        "Window Settings",
+        "Screenshot (Fullscreen)",
+        "Screenshot (Window)",
+        "Firefox",
+    ];
+    for query in [
+        "scrne wndoiw",
+        "wndoiw scrne",
+        "scrne window",
+        "scren wndoiw",
+    ] {
+        let result = hits(&catalog, query);
+        assert_eq!(
+            result.first().map(|hit| hit.0),
+            Some(3),
+            "{query}: {result:?}"
+        );
+    }
+    for (name, query) in [
+        ("Screenshot", "scrne"), // skipped letters plus a swap
+        ("Window", "wndoiw"),    // skipped letter plus an extra query letter
+        ("Terminal", "trmx"),    // skipped letters plus a substitution
+        ("Calculator", "clcux"),
+        ("Écran", "écrx"),
+    ] {
+        includes(name, query);
+    }
+    excludes("Chrome", "cxrxme");
+    excludes("Screenshot Window", "scrne zzzzzz");
+    excludes("Screenshot", "sc++");
+    excludes("Supercalifragilisticexpialidocious", "suxz");
+    let result = hits(&["Screenshot", "scrne", "scrne Tools"], "scrne");
+    assert_eq!(result[0].0, 1);
+    assert_eq!(result[1].0, 2);
+}
+
+#[test]
+fn subsequence_rows_agree_with_full_matrix_and_reuse_prefix_scratch() {
+    let mut words = vec![Vec::new()];
+    for len in 1..=4 {
+        for bits in 0..(1usize << len) {
+            words.push(
+                (0..len)
+                    .map(|i| if bits & (1 << i) == 0 { 'a' } else { 'b' })
+                    .collect(),
+            );
+        }
+    }
+    let mut scratch = super::EditScratch::default();
+    for query in &words {
+        for target in &words {
+            let mut matrix = vec![vec![0usize; target.len() + 1]; query.len() + 1];
+            for i in 1..=query.len() {
+                matrix[i][0] = i;
+                for j in 1..=target.len() {
+                    matrix[i][j] = matrix[i][j - 1]
+                        .min(matrix[i - 1][j] + 1)
+                        .min(matrix[i - 1][j - 1] + usize::from(query[i - 1] != target[j - 1]));
+                    if i > 1
+                        && j > 1
+                        && query[i - 1] == target[j - 2]
+                        && query[i - 2] == target[j - 1]
+                    {
+                        matrix[i][j] = matrix[i][j].min(matrix[i - 2][j - 2] + 1);
+                    }
+                }
+            }
+            for budget in [2, 0, 1] {
+                let expected = matrix[query.len()]
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter_map(|(j, &d)| (d <= budget).then_some((d, j)))
+                    .min();
+                assert_eq!(
+                    scratch.subsequence_distance(query, target, budget),
+                    expected,
+                    "query={query:?} target={target:?} budget={budget}"
+                );
+                assert_eq!(
+                    scratch.prefix_distance(query, target, budget),
+                    reference_prefix(query, target, budget)
+                );
+            }
+        }
+    }
+}
