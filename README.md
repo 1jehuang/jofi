@@ -51,6 +51,23 @@ Plain Cargo also works outside this development environment. The compositor must
 support `wlr-layer-shell`, `wl_subcompositor`, and `wp_viewporter`, as niri does.
 No X11 fallback is provided.
 
+### Text-entry prompts
+
+`jofi prompt LABEL [INITIAL_TEXT]` opens a free-text field without loading the
+application catalog. Enter prints the entered text and exits successfully,
+including for an empty answer. Escape cancels with exit status 1 and no stdout.
+Initial text is selected so typing replaces it. Existing clipboard and editing
+shortcuts work in prompts too.
+
+The optional recording helper uses this mode instead of Zenity or Rofi:
+
+```sh
+install -Dm755 contrib/rename-last-recording ~/.local/bin/rename-last-recording
+```
+
+It finds the newest finished recording, preserves its extension, avoids filename
+collisions, and skips renaming on cancellation or a blank answer.
+
 Optional niri binding, replacing the existing launcher line when ready:
 
 ```kdl

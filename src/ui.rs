@@ -44,6 +44,24 @@ pub fn choose(
     prepare_names: impl FnOnce() -> Result<Vec<String>, Box<dyn Error>>,
     pending_font: crate::font::Pending,
 ) -> Result<Option<usize>, Box<dyn Error>> {
+    Ok(show(prepare_names, pending_font, None)?.0)
+}
+
+/// Collect free text without discovering or launching applications.
+pub fn prompt(label: String, initial: &str) -> Result<Option<String>, Box<dyn Error>> {
+    Ok(show(
+        || Ok(Vec::new()),
+        crate::font::start(),
+        Some((label, initial)),
+    )?
+    .1)
+}
+
+fn show(
+    prepare_names: impl FnOnce() -> Result<Vec<String>, Box<dyn Error>>,
+    pending_font: crate::font::Pending,
+    prompt: Option<(String, &str)>,
+) -> Result<(Option<usize>, Option<String>), Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, queue) = registry_queue_init(&conn)?;
     let mut event_loop: EventLoop<Launcher> = EventLoop::try_new()?;
@@ -89,6 +107,11 @@ pub fn choose(
                 app.clipboard_reply(reply);
             }
         })?;
+    let mut query = crate::input::Query::default();
+    if let Some((_, initial)) = &prompt {
+        query.insert(initial);
+        query.select_all();
+    }
     let mut app = Launcher {
         loop_handle: event_loop.handle(),
         registry: RegistryState::new(&globals),
@@ -107,7 +130,9 @@ pub fn choose(
         font,
         names,
         search,
-        query: crate::input::Query::default(),
+        query,
+        prompt_label: prompt.map(|(label, _)| label),
+        text_answer: None,
         clipboard_sender,
         clipboard_pending: false,
         matches: Vec::new(),
@@ -128,7 +153,7 @@ pub fn choose(
     if let Some(error) = app.failure {
         return Err(error.into());
     }
-    Ok(app.answer)
+    Ok((app.answer, app.text_answer))
 }
 
 struct Launcher {
@@ -150,6 +175,8 @@ struct Launcher {
     names: Vec<String>,
     search: crate::search::SearchIndex,
     query: crate::input::Query,
+    prompt_label: Option<String>,
+    text_answer: Option<String>,
     clipboard_sender: channel::Sender<ClipboardReply>,
     clipboard_pending: bool,
     matches: Vec<(usize, Vec<usize>, i64)>,
@@ -329,8 +356,11 @@ impl Launcher {
             Keysym::Escape => self.done = true,
             Keysym::Return | Keysym::KP_Enter if self.clipboard_pending => {}
             Keysym::Return | Keysym::KP_Enter => {
+                if self.prompt_label.is_some() {
+                    self.text_answer = Some(self.query.text.clone());
+                }
                 self.answer = self.matches.get(self.selected).map(|m| m.0);
-                if self.answer.is_some() {
+                if self.answer.is_some() || self.text_answer.is_some() {
                     self.done = true;
                 }
             }
@@ -423,7 +453,9 @@ impl Launcher {
         let (logical_size, _, line_height) = text_metrics(&self.font);
         let font_size = logical_size * scale;
         let start = self.selected.saturating_sub(4);
-        let rows: Vec<&str> = if self.matches.is_empty() {
+        let rows: Vec<&str> = if let Some(label) = &self.prompt_label {
+            vec![label.as_str()]
+        } else if self.matches.is_empty() {
             vec!["No matches"]
         } else {
             self.matches
@@ -518,7 +550,7 @@ impl Launcher {
                 scale,
                 x,
                 y + line.round() as i32,
-                "No matches",
+                self.prompt_label.as_deref().unwrap_or("No matches"),
                 0xffffff,
                 &[],
             );

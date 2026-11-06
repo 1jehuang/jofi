@@ -6,6 +6,27 @@ use std::{
 };
 
 struct Fixture(PathBuf);
+
+#[test]
+fn prompt_validates_arguments_without_opening_wayland() {
+    let f = Fixture::new();
+    for args in [vec!["prompt"], vec!["prompt", "label", "initial", "extra"]] {
+        let output = f
+            .command()
+            .args(args)
+            .env_remove("WAYLAND_DISPLAY")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("usage: jofi prompt LABEL [INITIAL_TEXT]"));
+    }
+    let output = f.command().arg("--help").output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("jofi prompt LABEL"));
+}
+
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(

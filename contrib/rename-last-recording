@@ -1,0 +1,219 @@
+#!/bin/bash
+set -euo pipefail
+
+# Screen recordings are usually stored as one folder per recording under this dir.
+RECORDINGS_DIR="${RECORDINGS_DIR:-$HOME/Videos/Recordings}"
+
+# Flat recording directories cover Cheese/webcam-style recordings and the YC/founder-video helper.
+# Override with a colon-separated list if needed, for example:
+#   RENAME_LAST_RECORDING_DIRS="$HOME/Videos/YC:$HOME/Videos/Webcam" rename-last-recording
+FLAT_RECORDING_DIRS="${RENAME_LAST_RECORDING_DIRS:-$HOME/Videos/YC:$HOME/Videos/Webcam:$HOME/Videos:$RECORDINGS_DIR}"
+
+# Ignore tiny placeholder/corrupt videos, such as 48-byte mp4 files left by failed recordings.
+MIN_VIDEO_BYTES="${MIN_VIDEO_BYTES:-1024}"
+if ! [[ "$MIN_VIDEO_BYTES" =~ ^[0-9]+$ ]]; then
+    MIN_VIDEO_BYTES=1024
+fi
+if [ "$MIN_VIDEO_BYTES" -gt 0 ]; then
+    MIN_VIDEO_SIZE_CUTOFF=$((MIN_VIDEO_BYTES - 1))
+else
+    MIN_VIDEO_SIZE_CUTOFF=0
+fi
+
+notify() {
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send "$@" >/dev/null 2>&1 || true
+    fi
+}
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+is_video_path() {
+    local file="$1"
+    case "${file,,}" in
+        *.mp4|*.mkv|*.webm|*.mov) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_real_video_file() {
+    local file="$1"
+    local size
+
+    [ -f "$file" ] || return 1
+    is_video_path "$file" || return 1
+
+    size="$(stat -c '%s' "$file" 2>/dev/null || true)"
+    [ -n "$size" ] || return 1
+    [ "$size" -ge "$MIN_VIDEO_BYTES" ] || return 1
+}
+
+find_video_file() {
+    local dir="$1"
+    local preferred="$dir/video.mp4"
+
+    if is_real_video_file "$preferred"; then
+        printf '%s\n' "$preferred"
+        return 0
+    fi
+
+    find "$dir" -mindepth 1 -maxdepth 1 -type f \
+        \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mov' \) \
+        -size +"${MIN_VIDEO_SIZE_CUTOFF}"c \
+        -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr \
+        | awk 'NR == 1 { sub(/^[^ ]+ /, ""); print }'
+}
+
+emit_candidate() {
+    local file="$1"
+    local mtime
+
+    is_real_video_file "$file" || return 0
+    mtime="$(stat -c '%Y' "$file" 2>/dev/null || true)"
+    [ -n "$mtime" ] || return 0
+    printf '%s %s\n' "$mtime" "$file"
+}
+
+emit_structured_recording_candidates() {
+    local dir
+    local video_file
+
+    [ -d "$RECORDINGS_DIR" ] || return 0
+
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        video_file="$(find_video_file "$dir")"
+        [ -n "$video_file" ] || continue
+        emit_candidate "$video_file"
+    done < <(find "$RECORDINGS_DIR" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null)
+}
+
+emit_flat_recording_candidates() {
+    local dir
+    local expanded_dir
+    local seen=":"
+    local -a dirs
+
+    IFS=':' read -r -a dirs <<< "$FLAT_RECORDING_DIRS"
+    for dir in "${dirs[@]}"; do
+        [ -n "$dir" ] || continue
+        expanded_dir="${dir/#\~/$HOME}"
+        [ -d "$expanded_dir" ] || continue
+
+        case "$seen" in
+            *":$expanded_dir:"*) continue ;;
+        esac
+        seen="$seen$expanded_dir:"
+
+        find "$expanded_dir" -mindepth 1 -maxdepth 1 -type f \
+            \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mov' \) \
+            -size +"${MIN_VIDEO_SIZE_CUTOFF}"c \
+            -printf '%T@ %p\n' 2>/dev/null
+    done
+}
+
+latest_video_file() {
+    {
+        emit_structured_recording_candidates
+        emit_flat_recording_candidates
+        find "$HOME" -mindepth 1 -maxdepth 1 -type f -name 'recording-*.mp4' \
+            -size +"${MIN_VIDEO_SIZE_CUTOFF}"c -printf '%T@ %p\n' 2>/dev/null
+    } | sort -nr | awk 'NR == 1 { sub(/^[^ ]+ /, ""); print }'
+}
+
+prompt_for_name() {
+    local default_name="$1"
+
+    if [ -n "${RENAME_LAST_RECORDING_INPUT:-}" ]; then
+        printf '%s\n' "$RENAME_LAST_RECORDING_INPUT"
+        return 0
+    fi
+
+    if command -v jofi >/dev/null 2>&1; then
+        jofi prompt "Rename last recording (Esc to skip)" "$default_name"
+        return $?
+    fi
+
+    notify "Rename Last Recording" "jofi is required to enter a recording name." -i dialog-error -u normal
+    return 1
+}
+
+unique_target_path() {
+    local dir="$1"
+    local base_name="$2"
+    local ext="$3"
+    local candidate="$dir/$base_name.$ext"
+    local suffix=2
+
+    while [ -e "$candidate" ]; do
+        candidate="$dir/$base_name-$suffix.$ext"
+        suffix=$((suffix + 1))
+    done
+
+    printf '%s\n' "$candidate"
+}
+
+if pgrep -u "$(id -u)" -x wf-recorder >/dev/null 2>&1; then
+    notify "Rename Last Recording" "Stop the current recording first, then rename it." -i video-x-generic -u normal
+    exit 1
+fi
+
+VIDEO_FILE="$(latest_video_file)"
+if [ -z "$VIDEO_FILE" ] || [ ! -f "$VIDEO_FILE" ]; then
+    notify "Rename Last Recording" "No finished videos found. Checked $RECORDINGS_DIR plus: $FLAT_RECORDING_DIRS" -i dialog-error -u normal
+    exit 1
+fi
+
+LATEST_DIR="$(dirname "$VIDEO_FILE")"
+CURRENT_BASENAME="$(basename "$VIDEO_FILE")"
+CURRENT_STEM="${CURRENT_BASENAME%.*}"
+EXTENSION="${CURRENT_BASENAME##*.}"
+DEFAULT_NAME=""
+if [ "$CURRENT_STEM" != "video" ]; then
+    DEFAULT_NAME="$CURRENT_STEM"
+fi
+
+RAW_NAME="$(prompt_for_name "$DEFAULT_NAME")" || {
+    notify "Rename Last Recording" "Rename skipped." -i video-x-generic -u low
+    exit 0
+}
+
+NEW_NAME="$(trim "$RAW_NAME")"
+if [ -z "$NEW_NAME" ]; then
+    notify "Rename Last Recording" "Rename skipped." -i video-x-generic -u low
+    exit 0
+fi
+
+NEW_NAME="${NEW_NAME%.$EXTENSION}"
+NEW_NAME="$(trim "$NEW_NAME")"
+
+if [ -z "$NEW_NAME" ] || [ "$NEW_NAME" = "." ] || [ "$NEW_NAME" = ".." ]; then
+    notify "Rename Last Recording" "Please choose a valid file name." -i dialog-error -u normal
+    exit 1
+fi
+
+if [[ "$NEW_NAME" == */* ]]; then
+    notify "Rename Last Recording" "File names cannot contain /." -i dialog-error -u normal
+    exit 1
+fi
+
+TARGET_FILE="$LATEST_DIR/$NEW_NAME.$EXTENSION"
+if [ "$TARGET_FILE" = "$VIDEO_FILE" ]; then
+    notify "Rename Last Recording" "Already named $(basename "$VIDEO_FILE")." -i video-x-generic -u low
+    exit 0
+fi
+
+if [ -e "$TARGET_FILE" ]; then
+    TARGET_FILE="$(unique_target_path "$LATEST_DIR" "$NEW_NAME" "$EXTENSION")"
+fi
+
+mv -- "$VIDEO_FILE" "$TARGET_FILE"
+
+notify "Recording renamed" "$CURRENT_BASENAME → $(basename "$TARGET_FILE")\nFolder: $(basename "$LATEST_DIR")" -i video-x-generic -u normal
+printf 'Renamed: %s -> %s\n' "$VIDEO_FILE" "$TARGET_FILE"

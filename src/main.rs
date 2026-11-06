@@ -12,7 +12,7 @@ use std::{collections::HashMap, env, fs, path::PathBuf};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn usage() {
-    println!("jofi: minimal native Wayland app launcher\n\n  jofi                      Open launcher\n  jofi list                 List desktop apps and Rust scripts\n  jofi launch NAME [ARGS]   Launch an exact, unambiguous name\n  jofi build [--force]      Precompile Rust launchers\n  jofi usage                Inspect local usage counts (TSV)\n  jofi import-tofi PATH     Explicitly import Tofi frequency history\n  jofi paths                Show script and cache locations\n\nRust scripts: ~/.config/jofi/scripts/*.rs (or JOFI_SCRIPTS_DIR)\nOptional first-line metadata: // jofi-name: My app\nKeys: type to search, Up/Down or Tab to select, Enter to launch, Esc to close\nAlt/Ctrl+A select all, C copy, X cut, V paste; Alt/Ctrl+Backspace delete word; Ctrl+U clear");
+    println!("jofi: minimal native Wayland app launcher\n\n  jofi                      Open launcher\n  jofi prompt LABEL [TEXT]  Read free text to stdout (Esc exits 1)\n  jofi list                 List desktop apps and Rust scripts\n  jofi launch NAME [ARGS]   Launch an exact, unambiguous name\n  jofi build [--force]      Precompile Rust launchers\n  jofi usage                Inspect local usage counts (TSV)\n  jofi import-tofi PATH     Explicitly import Tofi frequency history\n  jofi paths                Show script and cache locations\n\nRust scripts: ~/.config/jofi/scripts/*.rs (or JOFI_SCRIPTS_DIR)\nOptional first-line metadata: // jofi-name: My app\nKeys: type to search, Up/Down or Tab to select, Enter to launch, Esc to close\nAlt/Ctrl+A select all, C copy, X cut, V paste; Alt/Ctrl+Backspace delete word; Ctrl+U clear");
 }
 fn identity(entry: &catalog::Entry) -> String {
     match &entry.target {
@@ -102,6 +102,16 @@ fn run() -> Result<()> {
         }
         Some("--version" | "-V") => {
             println!("jofi {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("prompt") => {
+            if !(2..=3).contains(&args.len()) {
+                return Err("usage: jofi prompt LABEL [INITIAL_TEXT]".into());
+            }
+            match ui::prompt(args[1].clone(), args.get(2).map_or("", String::as_str))? {
+                Some(text) => println!("{text}"),
+                None => std::process::exit(1),
+            }
             return Ok(());
         }
         Some("usage") => {
